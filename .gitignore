@@ -1,2 +1,5 @@
 /target/
 *.sock
+.claude/sessions/
+.claude/worktrees/
+.claude/.last-checkpoint
