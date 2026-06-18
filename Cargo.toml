@@ -21,3 +21,7 @@ nix = { version = "0.31", default-features = false, features = ["socket", "user"
 # fails dep-scan's 48h age gate; an RC AEAD in the crown-jewel secret path is unacceptable).
 # Default features (aes + alloc) only — the 96-bit nonce comes from /dev/urandom, no `rand` crate.
 aes-gcm = "0.10.3"
+# Opt-in, loopback-only, read-only HTTP read surface in the Vault KV-v2 API shape (ADR-006). Sync,
+# thread-per-connection — mirrors the existing UnixListener model exactly; no async runtime, no
+# tokio. Pinned to 0.12; small tree (ascii/chunked_transfer/httpdate/log) — dep-scan gate on task 005.
+tiny_http = "0.12"

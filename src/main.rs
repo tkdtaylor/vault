@@ -5,11 +5,13 @@
 //! wiped. See README.md.
 //!
 //! Usage:
-//!   vault serve --socket /run/vault.sock          # IPC daemon (resolve/inject/put/ping)
-//!   vault demo                                     # run put->resolve->inject in-process
+//!   vault serve --socket /run/vault.sock                                  # IPC daemon (resolve/inject/put/ping)
+//!   vault serve --socket /run/vault.sock --http-addr 127.0.0.1:8200       # + opt-in loopback HTTP read surface
+//!   vault demo                                                            # run put->resolve->inject in-process
 
 mod crypto;
 mod handle;
+mod http;
 mod vault;
 
 use std::fs;
@@ -50,6 +52,16 @@ fn serve(args: &[String]) {
     eprintln!("vault serving on {socket}");
 
     let v = Arc::new(Mutex::new(Vault::new()));
+
+    // Opt-in HTTP read surface (ADR-006). Absent → no TCP listener starts and the Unix socket
+    // serves exactly as before (default posture unchanged). Present → a loopback-only, read-only
+    // HTTP listener runs on its own thread, sharing the SAME Arc<Mutex<Vault>> as the Unix socket;
+    // a non-loopback --http-addr is refused fail-closed inside serve_http (no wildcard bind ever).
+    if let Some(http_addr) = flag(args, "--http-addr") {
+        let http_v = Arc::clone(&v);
+        std::thread::spawn(move || http::serve_http(&http_addr, http_v));
+    }
+
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let v = Arc::clone(&v);

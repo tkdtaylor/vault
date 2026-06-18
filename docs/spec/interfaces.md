@@ -20,6 +20,7 @@ vault <serve|demo> [flags]
 
 Subcommands:
   serve     run the newline-delimited-JSON-over-Unix-socket IPC daemon
+            (+ an opt-in loopback-only read-only HTTP read surface, ADR-006)
   demo      run put -> resolve -> inject -> replay-rejected in-process and print each step
 ```
 
@@ -27,6 +28,7 @@ Subcommands:
 |-------------------|------|---------|--------|
 | `serve` | subcommand | — | Start the IPC daemon (long-running) |
 | `serve --socket` | string (path) | — (required) | Unix socket path to bind; a stale socket is removed first; bound `0600`. Missing → usage error |
+| `serve --http-addr` | string (`HOST:PORT`) | — (absent → no HTTP listener) | **Opt-in** loopback HTTP read surface (ADR-006). Present → bind a thread-per-connection HTTP listener sharing the same `Vault` as the Unix socket — but **only if** the host is the literal `127.0.0.1`; a non-loopback host (`0.0.0.0`, a LAN IP, `::`) is **refused fail-closed** (logged, no bind). Absent → the Unix socket serves exactly as before |
 | `demo` | subcommand | — | One-shot in-process demonstration; stdout only |
 
 **Exit codes:**
@@ -58,6 +60,46 @@ closes after the response.
   unreadable peer credential is rejected fail-closed with `peer_uid_denied` and **no op runs**. The
   `0600` mode and the peer-uid assertion are the two halves of the D5 uid restriction (ADR-002).
 - Error codes and the structured error shape are in [data-model.md](data-model.md).
+
+### HTTP read surface (TCP) — opt-in, loopback-only, read-only, zero-knowledge
+
+A **second** inbound listener, started **only** when `serve --http-addr 127.0.0.1:PORT` is passed
+(ADR-006). It speaks the HashiCorp Vault / OpenBao **KV-v2 API shape** so existing Vault tooling can
+interoperate through the seam — but it is **zero-knowledge**: a read returns the **handle** in a
+Vault-shaped envelope, **never the value**. It is **read-only** — `inject`/`put`/`rotate`/`get`/`list`
+are **not routed** here (no method+path reaches them). Its trust model is deliberately **different**
+from the Unix socket: the Unix socket is `SO_PEERCRED`-gated with the full verb set; the HTTP surface
+is **unauthenticated** (vault has no token model yet) and so is loopback-only + read-only.
+
+| Method + path | Maps to | Response |
+|---------------|---------|----------|
+| `GET /v1/sys/health` | (no store access) | `200 {"initialized":true,"sealed":false}` — liveness only |
+| `GET /v1/secret/data/:path` | `Vault::resolve("vault://:path", 300)` | `200 {"data":{"data":{"handle":…,"injection_mode":…},"metadata":{"ttl":…}}}` — KV-v2 envelope carrying the **handle**, **never the value** |
+
+The path tail after `/v1/secret/data/` becomes the `vault://`-scheme `secret_ref` verbatim, nested
+segments preserved (`/v1/secret/data/team/prod/db` → `vault://team/prod/db`). The read mints a
+single-use handle with a fixed TTL of `300`s (the HTTP surface has no per-request TTL knob).
+
+**Error → HTTP status mapping** (Vault's shapes, so existing clients see familiar responses):
+
+| Condition | Status | Body |
+|-----------|--------|------|
+| unknown secret (`no_such_secret`) | `404` | `{"errors":[]}` |
+| unroutable path / empty `secret/data` tail | `404` | `{"errors":[]}` |
+| non-GET method (POST/PUT/DELETE/…) | `405` | `{"errors":["method not allowed"]}` |
+| malformed / over-long request (body > 8 KiB) | `400` | `{"errors":["bad request"]}` |
+| handle-mint failure (`rng_error`) | `500` | `{"errors":["internal error"]}` |
+
+- **No value crosses the TCP boundary** — `resolve` is value-free by construction, so the envelope
+  carries only the opaque handle. The plaintext continues to re-materialise **only** at `inject` over
+  the `SO_PEERCRED`-gated Unix socket. There is no HTTP path, success or error, on which a cleartext
+  value leaves the process.
+- **Loopback-only, fail-closed bind** — the listener binds `127.0.0.1` only; a non-loopback
+  `--http-addr` is refused (logged, no bind), never a wildcard. Remote/`0.0.0.0` exposure waits on
+  the auth model (roadmap row 6).
+- The pure decision functions are `http_route(method, path)`, `http_secret_ref(path)`,
+  `kv2_envelope(resolved)`, `loopback_only(addr)`, and `http_response_for(route, vault)` in
+  `src/http.rs` (the same precedent as `peer_uid_allowed` / `handle_line`).
 
 ### Contract verbs — all four admin verbs wired
 
