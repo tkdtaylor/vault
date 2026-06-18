@@ -21,12 +21,16 @@ points* ([interfaces.md](interfaces.md)).
   ciphertext + nonce is inserted into the in-memory store keyed by `secret_ref`, carrying its
   `injection_floor` (the minimum mode any later `inject` may deliver) and its `Binding`. The
   **cleartext is not retained** after `put` returns (ADR-005). IPC returns `{"ok":true}`.
-- **Side effects:** mutates the in-memory store (with ciphertext); nothing is persisted to disk.
+- **Side effects:** mutates the in-memory store (with ciphertext). With `--store-path` set, the
+  encrypted store is **written-through to disk** atomically after the insert (B-019); unset → no disk
+  I/O.
 - **Failure modes:** an absent `injection_floor` defaults to `env`; an absent/invalid `binding`
   defaults to `{host:"", header:"Authorization", scheme:"Bearer", env_var:"API_KEY"}`. The value
   is **never** logged or echoed. If encryption fails (no master key configured, nonce-RNG failure)
-  the put **fails closed** — nothing is stored for that ref (no plaintext fallback), so a later
-  `resolve` of the unstored ref returns `no_such_secret`. *(Tests:
+  the put **fails closed** with `encrypt_failed` — nothing is stored for that ref (no plaintext
+  fallback), so a later `resolve` of the unstored ref returns `no_such_secret`. With `--store-path`
+  set, a failed disk write rolls back the in-memory insert and returns `store_persist_failed`
+  (B-019) — never a silent success. *(Tests:
   `tc001_put_stores_ciphertext_not_plaintext`, `tc006_at_rest_negative_cleartext_absent`.)*
 
 ### B-012: Read a secret's metadata (admin `get`) — never the value
@@ -59,10 +63,14 @@ points* ([interfaces.md](interfaces.md)).
   `{ "ok":true, "rotated":true, "injection_floor":…, "binding":{…} }`. **The value is never echoed
   back** (neither the old nor the new). A subsequent resolve→inject delivers the new value normally.
 - **Side effects:** replaces the stored ciphertext and **bumps the secret's generation counter**,
-  which invalidates every handle resolved against the prior value (B-015 / ADR-004).
+  which invalidates every handle resolved against the prior value (B-015 / ADR-004). With
+  `--store-path` set, the rotated store (fresh nonce + bumped generation) is **written-through to
+  disk** atomically (B-019); unset → no disk I/O.
 - **Failure modes:** an unknown or empty `secret_ref` → `{error:{code:"no_such_secret",…}}`, nothing
   rotated. A re-encryption failure → `{error:{code:"encrypt_failed",…}}`, the prior ciphertext left
-  untouched. *(Tests: `tc004_rotate_swaps_value_preserves_metadata_no_echo`,
+  untouched. With `--store-path` set, a failed disk write rolls the in-memory entry back to its
+  pre-rotate state and returns `store_persist_failed` (B-019). *(Tests:
+  `tc004_rotate_swaps_value_preserves_metadata_no_echo`,
   `tc005_rotate_invalidates_pre_rotation_handle`, `tc007_no_admin_verb_leaks_value`,
   `tc004_unique_nonces_no_reuse`.)*
 
@@ -186,7 +194,8 @@ points* ([interfaces.md](interfaces.md)).
   (unparseable JSON), `unknown_op` (unsupported op), `no_such_secret`, `unknown_handle`,
   `handle_consumed`, `handle_expired` (TTL elapsed — B-011), `handle_invalidated` (secret rotated
   after resolve — B-015), `handle_bound_to_other_sandbox`, `decrypt_failed` (tampered ciphertext —
-  B-016), `encrypt_failed` (rotate re-encryption failure — B-014), `rng_error`.
+  B-016), `encrypt_failed` (put/rotate encryption failure — B-001/B-014), `store_persist_failed`
+  (put/rotate disk write failure with `--store-path` — B-019), `rng_error`.
 - **Side effects:** none; the connection is closed after the single response.
 - **Failure modes:** the caller must treat any `error` response as a non-delivery (fail-closed);
   vault never delivers a credential for a malformed, unknown, or unsupported request.
@@ -274,6 +283,50 @@ points* ([interfaces.md](interfaces.md)).
   `tc008_unroutable_get_is_404_admin_unreachable`, `tc009_request_size_bound_is_named`,
   `tc010_no_path_leaks_value`; ADR-006.)*
 
+### B-019: Write-through the encrypted store on mutation (`--store-path`, atomic + 0600)
+
+- **Trigger:** a successful `put` or `rotate` when `--store-path PATH` is set. (`resolve`/`inject`/
+  `get`/`list` never trigger it.)
+- **Response:** after the in-memory mutation succeeds, the **whole encrypted store** is serialized to
+  `PATH` and written **atomically, `0600`, and safe-by-construction**: a temp file `<PATH>.tmp.<hex>`
+  (random `/dev/urandom` suffix) in the same directory is created with `O_CREAT | O_EXCL |
+  O_NOFOLLOW` and mode `0o600` set **at creation** (no chmod-after-open window, no predictable or
+  follow-able temp path — SEC-001), then `write_all` + `fsync`, then an atomic `rename` over `PATH`,
+  then an **`fsync` of the parent directory** so the rename is durable (SEC-002). The file holds the
+  `StoredRecord` DTO per ref — base64 `ciphertext` + `nonce` + cleartext
+  `injection_floor`/`binding`/`generation` — **never the key, never the cleartext, never any handle**
+  (ADR-008 §2/§5/§6).
+- **Side effects:** replaces the store file on disk; the prior file is left intact until the atomic
+  rename. A crash mid-write leaves either the old complete file or the temp file — never a
+  half-written store. A pre-existing temp path (planted symlink or stale temp) makes the write fail
+  closed (`O_EXCL`/`O_NOFOLLOW`) rather than overwriting an attacker-chosen target (SEC-001).
+- **Failure modes:** a failed write (disk full, permission, fsync error, a squatted/symlinked temp
+  path) → the in-memory mutation is **rolled back** to its prior state and the op returns
+  `{error:{code:"store_persist_failed",…}}` — never a silent success that diverges from disk. The
+  temp file is best-effort removed and `PATH` is left intact. *(Tests: `tc006_store_file_is_0600`,
+  `tc007_failed_persist_is_store_persist_failed_and_atomic`,
+  `tc008_write_through_on_put_and_rotate_only`, `temp_file_is_created_0600_at_creation`,
+  `temp_open_refuses_preexisting_path`, `temp_open_refuses_to_follow_symlink`; ADR-008 §4.)*
+
+### B-020: Load the encrypted store on startup; refuse to start on corruption; handles never persist
+
+- **Trigger:** `serve --store-path PATH` (or `VAULT_STORE_PATH`; the flag wins) at startup.
+- **Response:** the store file is read and parsed (JSON → `version == 1` check → base64-decode each
+  record into an `EncryptedValue`, nonce validated as 12 bytes) and the in-memory `store` is built as
+  **ciphertext** — **no decryption at load**; decrypt stays at the `inject` edge (ADR-008 §7). The
+  **handle table starts empty** — handles never persist (ADR-008 §5).
+- **Side effects:** populates the in-memory store from disk; opens no decrypt path.
+- **Failure modes:** a **missing** file is a fresh empty store (first run, not an error — the first
+  `put` creates it). A **structurally corrupt** file (bad JSON / unknown version / invalid base64 /
+  wrong-length nonce) makes `serve` **refuse to start** — a logged diagnostic and a non-zero exit
+  (`1`), **no panic**, the store never silently emptied (ADR-008 §8). A **wrong master key** does
+  *not* surface at load (ciphertext-only load) — it surfaces at the first `inject` as
+  `decrypt_failed`; likewise a tampered-but-structurally-valid ciphertext loads fine and fails closed
+  at `inject`. A **pre-restart handle** is dead after a restart → `unknown_handle` (handles never
+  persist). *(Tests: `tc001_restart_round_trips_plaintext`,
+  `tc002_key_never_on_disk_wrong_key_fails_at_inject`, `tc004_handles_do_not_persist`,
+  `tc005_tamper_and_corrupt_fail_closed`; ADR-008 §7/§8.)*
+
 ---
 
 ## Edge cases and error behaviors
@@ -330,3 +383,10 @@ points* ([interfaces.md](interfaces.md)).
   fail-closed; and absent the flag there is no HTTP listener at all. The two listeners are
   asymmetric by design: the Unix socket is `SO_PEERCRED`-gated with the full verb set, the HTTP
   surface is unauthenticated and therefore loopback + read-only (B-017, B-018, ADR-006).
+- **On-disk persistence is opt-in, ciphertext-only, key-off-disk, handles-never-persist.** Unset
+  `--store-path` ⇒ in-memory only, byte-for-byte today's behavior (no file read/written). Set ⇒ the
+  encrypted store loads on startup and writes-through atomically on `put`/`rotate` (`0600`, temp +
+  fsync + rename). The file carries AEAD ciphertext + nonce + non-secret metadata only — never the
+  master key, never the cleartext, never a handle. A restart invalidates every outstanding handle
+  (`unknown_handle`); a corrupt file refuses to start (no panic); a failed write surfaces
+  `store_persist_failed` and rolls back (B-019, B-020, ADR-008).

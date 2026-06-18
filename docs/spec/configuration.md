@@ -3,9 +3,9 @@
 **Project:** vault
 **Last updated:** 2026-06-18
 
-Every knob the system exposes. vault is configured entirely by **command-line flags** and the
-per-secret fields supplied to `put` in v0 — there are no config files and no application
-environment variables.
+Every knob the system exposes. vault is configured by **command-line flags**, the per-secret fields
+supplied to `put`, and a small set of **application environment variables** (the at-rest master key
+and the opt-in store path) — there are no config files.
 
 Not here: what gets configured ([behaviors.md](behaviors.md)); the parsing lives in `src/main.rs`.
 
@@ -14,8 +14,9 @@ Not here: what gets configured ([behaviors.md](behaviors.md)); the parsing lives
 ## Configuration files
 
 **None.** No config file. Secrets are supplied inline via the `put` op; the socket path is supplied
-inline via `--socket`. There is no external policy or store-config source to point at (the v0 store
-is in-memory).
+inline via `--socket`. There is no external policy source to point at. The store is in-memory by
+default; an **opt-in** persistent encrypted store file is enabled with `--store-path PATH` /
+`VAULT_STORE_PATH` (a JSON ciphertext store, **not** a config file — ADR-008).
 
 ---
 
@@ -25,8 +26,13 @@ is in-memory).
 |------|------------|------|---------|----------|--------|
 | `--socket` | `serve` | string (path) | — | yes (serve) | Unix socket to bind; a stale socket at the path is removed first; bound `0600` |
 | `--http-addr` | `serve` | string (`HOST:PORT`) | — (absent → no HTTP listener) | no | **Opt-in** loopback HTTP read surface (ADR-006). Present → bind a read-only HTTP listener sharing the same `Vault`, but **only if** the host is literal `127.0.0.1`; a non-loopback host is **refused fail-closed** (logged, no bind). Absent → the Unix socket serves exactly as before |
+| `--store-path` | `serve` | string (path) | — (absent → in-memory only) | no | **Opt-in** persistent encrypted store (ADR-008). Present → load the encrypted store from `PATH` on startup and write-through every `put`/`rotate` atomically (`0600` JSON, ciphertext + metadata only). Falls back to `VAULT_STORE_PATH` if the flag is absent (**flag wins**). Absent → in-memory only, byte-for-byte today's behavior (no file read/written) |
 
 `demo` takes no flags. A missing subcommand or a `serve` without `--socket` → usage error (exit `2`).
+A `serve` whose `--store-path` file is present but **corrupt** (bad JSON / unknown version / invalid
+base64 / wrong-length nonce) **refuses to start** with a logged diagnostic and a non-zero exit
+(`1`) — the store is never silently emptied (ADR-008 §8). A **missing** file is a fresh empty store
+(first run), not an error.
 
 **`--http-addr` is loopback-only and fail-closed.** The HTTP read surface (`GET /v1/sys/health`,
 `GET /v1/secret/data/:path`) is zero-knowledge — a read returns the handle in a Vault KV-v2 envelope,
@@ -73,6 +79,34 @@ rule F-006.
 
 ---
 
+## Store-file permissions and atomicity (`--store-path`)
+
+When `--store-path PATH` is set, the persistent store file is written **`0600`** (owner-only) — the
+on-disk analogue of the `0600` socket: the filesystem ACL stops other uids from reading the
+ciphertext. The write is **atomic, crash-safe, and safe-by-construction**: a temp file
+`<PATH>.tmp.<hex>` in the same directory is created with `O_CREAT | O_EXCL | O_NOFOLLOW` and mode
+`0o600` set **at creation** (not chmod-after-open — there is no umask-mode window), where `<hex>` is
+fresh random bytes from `/dev/urandom` so the temp path is unpredictable across restarts. A
+pre-existing temp path — a planted symlink or a stale temp — is an **error** (`O_EXCL`), never
+silently reused, and the open refuses to follow a symlink (`O_NOFOLLOW`), closing the symlink/TOCTOU
+arbitrary-overwrite vector (SEC-001). Then `write_all` + `fsync`, an atomic `rename` over `PATH`,
+and finally an **`fsync` of the parent directory** so the rename's directory-entry update itself
+survives a crash (SEC-002). A crash mid-write leaves either the old complete file or the temp file
+— never a half-written store. A failed write surfaces `store_persist_failed` and rolls back the
+in-memory mutation (ADR-008 §4). The file holds **ciphertext + nonce + non-secret metadata only** —
+the master key and the cleartext are never written, and **handles never persist** (ADR-008 §5/§6).
+
+**Operator invariant — store-directory posture (SEC-003).** The `--store-path` **parent
+directory** MUST be owned by the vault uid and **not group- or world-writable**. The `0600` file
+protects the store's *contents*, but a writable directory is the surface for temp-path games
+(planting a symlink at the temp name, racing the rename). FIX 1's `O_EXCL`/`O_NOFOLLOW`/random
+suffix already closes the active vector; the directory restriction is defense-in-depth and is the
+operator's responsibility. At `serve` startup with a store path set, vault emits a **non-fatal
+stderr WARNING** if the parent directory is group/world-writable (it does **not** refuse to start,
+and never logs any secret — only the directory path and its mode).
+
+---
+
 ## Environment variables
 
 **Application — the at-rest master key (ADR-005):** the AES-256-GCM store key is sourced from the
@@ -82,6 +116,12 @@ environment via the key-provider seam (`EnvKeyProvider`), in precedence order:
 |-----|------|--------|
 | `VAULT_MASTER_KEY_FILE` | path | File whose contents are the 32-byte master key (hex `64`-char or base64). Takes precedence over the inline var. |
 | `VAULT_MASTER_KEY` | string | The 32-byte master key inline (hex or base64). Used if `…_FILE` is unset. |
+
+**Application — the persistent store path (ADR-008):**
+
+| Var | Type | Effect |
+|-----|------|--------|
+| `VAULT_STORE_PATH` | path | Fallback source for `--store-path` (the flag wins). Set → opt-in persistent encrypted store at this path; unset (and no flag) → in-memory only. |
 
 The key is decoded to **exactly 32 bytes** (anything else is an error). It is held only in the
 backend's memory — **never serialized into the store, never logged**. A **missing/unreadable/wrong-
@@ -106,9 +146,10 @@ a value, and never writes a value to the repo.
 | Application credentials (API keys, tokens) | supplied at runtime via the `put` op | minted into single-use handles (`resolve`); delivered to the injection edge (`inject`) |
 | AES-256-GCM master key (32 bytes) | `VAULT_MASTER_KEY` / `VAULT_MASTER_KEY_FILE` (operator-supplied) | encrypts every stored value at rest; held only in backend memory, off the ciphertext (ADR-005) |
 
-The stored value is **AES-256-GCM ciphertext at rest** (in process memory), decrypted only at the
-injection edge — the master key (above) is the protection on the value at rest, and it lives off the
-ciphertext. There is no on-disk persistence yet.
+The stored value is **AES-256-GCM ciphertext at rest** — in process memory always, and (with
+`--store-path` set) on disk in the `0600` store file — decrypted only at the injection edge. The
+master key (above) is the protection on the value at rest, and it lives off the ciphertext **and off
+the store file**. A stolen store file is inert without the separately-held key (ADR-008).
 
 **Rule:** secrets — application credentials **and the master key** — are never pasted into chat,
 logged, or written into the repo. The `protect-secrets` hook blocks writes to common credential
@@ -124,6 +165,7 @@ is an ephemeral in-process value.
 | Artifact | single static Rust binary (`vault`) | `cargo build` → `target/release/vault` |
 | Socket | Unix domain socket at `--socket` path | `chmod 0600` **plus** an `SO_PEERCRED` peer-uid check (admit iff peer uid == server uid); co-located with the agent, not network-exposed |
 | Ports exposed | none by default; **opt-in** loopback TCP via `--http-addr 127.0.0.1:PORT` | The HTTP read surface (ADR-006) is off unless `--http-addr` is passed, and binds `127.0.0.1` only (a non-loopback bind is refused fail-closed). Read-only + zero-knowledge — never delivers a value |
+| On-disk store | none by default; **opt-in** `0600` JSON file via `--store-path PATH` / `VAULT_STORE_PATH` | The persistent encrypted store (ADR-008) is off unless a path is set. Ciphertext + non-secret metadata only; key off-disk, handles never persist; atomic `0600` write-through on `put`/`rotate`; refuse-to-start on a corrupt file |
 | Runtime dependencies | `serde` + `serde_json` + `nix` (socket+user) + `aes-gcm` 0.10.3 (AES-256-GCM) + `tiny_http` 0.12 (HTTP read surface) | `nix` supplies `SO_PEERCRED`/`geteuid` for the peer-uid gate (ADR-002); `aes-gcm` 0.10.3 supplies the at-rest AEAD (ADR-005), pinned to the stable line (the 0.11 RC was rejected) and dep-scan-cleared; `tiny_http` 0.12 (sync, thread-per-connection — no async runtime) supplies the opt-in loopback HTTP read surface (ADR-006), pinned and dep-scan-cleared (tree: `ascii`/`chunked_transfer`/`httpdate`/`log`); no `rand` crate (RNG/nonces via `/dev/urandom`); dep-scan / code-scanner are blocking gates for any further crypto/dependency change |
 | Master key | `VAULT_MASTER_KEY` / `VAULT_MASTER_KEY_FILE` (32 bytes, hex/base64) | required for a production `serve` (store fails closed without it); `demo` uses an ephemeral in-process key |
 

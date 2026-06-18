@@ -3,10 +3,12 @@
 **Project:** vault
 **Last updated:** 2026-06-18
 
-What data exists, how it's structured, and the wire formats crossing the process boundary. vault
-has **no on-disk persistence** — all state is in-memory or on the wire. The in-memory store holds
-each secret value as **AES-256-GCM ciphertext** (encrypted at rest in process memory), never
-plaintext; the cleartext re-materialises only at the injection edge (ADR-005).
+What data exists, how it's structured, and the wire formats crossing the process boundary. The
+in-memory store holds each secret value as **AES-256-GCM ciphertext** (encrypted at rest in process
+memory), never plaintext; the cleartext re-materialises only at the injection edge (ADR-005). With
+the **opt-in** `--store-path` set, that encrypted store is also persisted to a single `0600` JSON
+file — **ciphertext + non-secret metadata only**; the master key and the cleartext are never
+written, and handles never persist (ADR-008).
 
 Not here: operations ([behaviors.md](behaviors.md)), how data is accessed
 ([interfaces.md](interfaces.md)), tunables ([configuration.md](configuration.md)).
@@ -15,11 +17,53 @@ Not here: operations ([behaviors.md](behaviors.md)), how data is accessed
 
 ## Persistent state
 
-**None on disk.** vault holds no database and no files beyond the transient Unix socket it binds.
-The store is in-memory and lost on restart. "Encrypted at rest" here means **at rest in process
-memory** — the value bytes a memory dump would expose are AES-256-GCM ciphertext, not cleartext.
-On-disk persistence can be added behind the same `StoreBackend` seam without re-touching the secret
-path (ADR-005).
+**Opt-in, off by default.** With no `--store-path` / `VAULT_STORE_PATH`, vault holds no database
+and no files beyond the transient Unix socket it binds — the store is in-memory and lost on restart
+(today's default posture, byte-for-byte). With `--store-path PATH` set, the encrypted store is
+persisted to a single JSON file at `PATH` and reloaded on startup (ADR-008).
+
+### State: the store file (`--store-path PATH`)
+
+- **Format:** a single plain-text JSON file. Shape:
+
+  ```json
+  {
+    "version": 1,
+    "records": {
+      "vault://test/api_key": {
+        "ciphertext_b64": "…",
+        "nonce_b64": "…",
+        "injection_floor": "proxy",
+        "binding": { "host": "api.example.com", "header": "Authorization", "scheme": "Bearer", "env_var": "API_KEY" },
+        "generation": 3
+      }
+    }
+  }
+  ```
+
+  Records are serialized through a dedicated `StoredRecord` DTO (`src/store_file.rs`) so the internal
+  `Secret` / `EncryptedValue` stay serde-free. `ciphertext` and `nonce` are base64-encoded JSON
+  strings (hand-rolled `encode_base64` / `decode_base64` in `src/crypto.rs`, no base64 crate).
+- **Contents:** AEAD **ciphertext** + the (non-secret) **nonce** + cleartext metadata
+  (`injection_floor`, `binding`, `generation`). The 32-byte master **key is never written**, and the
+  **cleartext value is never written** (ADR-008 §6). **Handles never persist** — only `store` is
+  serialized, so a restart starts with an empty handle table and every outstanding handle is dead
+  (`unknown_handle`) (ADR-008 §5).
+- **Load (startup):** parse JSON → check `version == 1` → base64-decode each record into an
+  `EncryptedValue` (nonce validated as exactly 12 bytes) → build the in-memory `store`. **No
+  decryption at load** — decrypt stays at the `inject` edge; a wrong key surfaces there as
+  `decrypt_failed`, not at load (ADR-008 §7). A **missing** file is a fresh empty store (first run,
+  not an error); a **structurally corrupt** file (bad JSON / unknown version / invalid base64 /
+  wrong-length nonce) makes `serve` **refuse to start** (non-zero exit, no panic, store never
+  silently emptied — ADR-008 §8).
+- **Write-through (mutation):** `put` and `rotate` persist the whole file after the in-memory
+  mutation, **atomically and `0600`** — temp file `<PATH>.tmp.<pid>` in the same directory, `chmod
+  0600` before any bytes, `write_all` + `fsync`, atomic `rename` over `PATH` (ADR-008 §4). A failed
+  persist rolls back the in-memory mutation and surfaces `store_persist_failed` — never a silent
+  success. `resolve`/`inject`/`get`/`list` never write.
+- **Mode:** `0600` (same-uid-only by filesystem ACL — the on-disk analogue of the uid-restricted
+  socket). A tampered-but-structurally-valid ciphertext loads fine and fails closed at `inject`
+  (`decrypt_failed`); the AEAD tag is the value-integrity check.
 
 ---
 
@@ -38,8 +82,9 @@ path (ADR-005).
   production — which owns the master key (from the key-provider seam) in its own memory, **never
   beside the ciphertext**.
 - **Lifetime:** process lifetime; populated by `put` (which **encrypts** the value with a fresh
-  nonce), value replaced in place by `rotate` (which **re-encrypts** with a fresh nonce). Not
-  persisted to disk.
+  nonce), value replaced in place by `rotate` (which **re-encrypts** with a fresh nonce). Persisted
+  to the `--store-path` file (ciphertext + metadata only) on `put`/`rotate` and reloaded on startup
+  when persistence is enabled; in-memory only otherwise (ADR-008).
 - **Concurrency rules:** the whole `Vault` is guarded by a `Mutex` in `serve`; each connection
   locks it for the duration of its op.
 - **Bounds:** bounded by the number of secrets `put`.
@@ -111,7 +156,27 @@ struct EncryptedValue {
 - **Nonce:** fresh random 96 bits per `put`/`rotate`, drawn from `/dev/urandom` (no `rand` crate).
   The nonce is not secret and may be stored/transmitted in the clear; the tag authenticates the
   ciphertext, so tamper/truncation fail closed on decrypt (`decrypt_failed`).
-- **No serde derive** — it never crosses the wire; no AEAD type leaks into a contract response.
+- **No serde derive** — it never crosses the wire and is not serialized into the store file
+  directly; the on-disk `StoredRecord` DTO carries the serde derives and maps to/from it, so no AEAD
+  type leaks into a contract response and a value-field leak would have to be typed into the DTO.
+
+### Type: `StoredRecord` (on-disk DTO — `src/store_file.rs`)
+
+```
+struct StoredRecord {
+  ciphertext_b64:  String,   // base64 of EncryptedValue.ciphertext (AES-256-GCM ct + tag)
+  nonce_b64:       String,   // base64 of the 12-byte nonce
+  injection_floor: Mode,     // "env" | "proxy"  — non-secret metadata
+  binding:         Binding,  // non-secret metadata
+  generation:      u64,      // rotate counter — persisted so on-disk truth stays correct
+}
+```
+
+- **Serde derive lives here**, not on `Secret` / `EncryptedValue` (ADR-008 §2). `Vault` maps
+  `Secret ⇄ StoredRecord` explicitly, keeping the internal types wire-free and the disk format an
+  intentional, reviewable surface. There is **no field for the cleartext value or the key** — only
+  ciphertext, nonce, and non-secret metadata are representable.
+- **Used only** by the `--store-path` persistence layer; absent from every IPC/HTTP wire response.
 
 ### Seam: `KeyProvider` (the master-key source) and `StoreBackend` (the encryption seam)
 
@@ -139,8 +204,10 @@ response line back.
   "binding":{ "host":"api.example.com", "header":"Authorization", "scheme":"Bearer", "env_var":"API_KEY" } }
 ```
 
-→ `{ "ok": true }`. Absent `injection_floor` defaults to `env`; absent/invalid `binding` defaults
-as above.
+→ `{ "ok": true }` on success. Absent `injection_floor` defaults to `env`; absent/invalid `binding`
+defaults as above. Fail-closed: no key configured → `{error:{code:"encrypt_failed",…}}` (nothing
+stored); with `--store-path` set, a failed disk write → `{error:{code:"store_persist_failed",…}}`
+(in-memory insert rolled back).
 
 ### Format: `resolve` request / response
 
@@ -202,7 +269,8 @@ All current errors are `retryable:false`. Codes:
 | `handle_invalidated` | `false` | `inject` of a handle whose secret was rotated after the handle was resolved (generation mismatch — ADR-004); checked after expiry, before binding |
 | `handle_bound_to_other_sandbox` | `false` | `inject` from a sandbox other than the bound one |
 | `decrypt_failed` | `false` | `inject` whose stored ciphertext fails the AES-256-GCM tag check (tampered / truncated / wrong key) — no credential, no panic (ADR-005) |
-| `encrypt_failed` | `false` | `rotate` whose re-encryption fails (e.g. nonce-RNG failure); the prior ciphertext is left untouched (ADR-005) |
+| `encrypt_failed` | `false` | `put`/`rotate` whose encryption fails (e.g. no key configured, nonce-RNG failure); nothing is stored / the prior ciphertext is left untouched (ADR-005) |
+| `store_persist_failed` | `false` | `put`/`rotate` whose atomic write to the `--store-path` file failed (disk full, permission, fsync); the in-memory mutation is rolled back, the prior file is left intact — never a silent success (ADR-008 §4) |
 | `rng_error` | `false` | `/dev/urandom` read failure while minting a handle |
 
 ---
@@ -230,7 +298,18 @@ All current errors are `retryable:false`. Codes:
   encryption) and at `inject` (after decrypt, at the injection edge). A tampered ciphertext fails
   closed (`decrypt_failed`), never a silent wrong value (ADR-005).
 - **The master key lives off the ciphertext.** The 32-byte AES key is held only in the backend's
-  memory (from the `KeyProvider` seam) — never serialized into the store, never logged. A missing
-  key fails the store closed (no plaintext fallback).
+  memory (from the `KeyProvider` seam) — never serialized into the store **or the store file**,
+  never logged. A missing key fails the store closed (no plaintext fallback).
+- **The store file is ciphertext-only at rest.** With `--store-path` set, the file holds AEAD
+  ciphertext + nonce + non-secret metadata only — never the key, never the cleartext. A stolen file
+  is inert without the separately-held master key (a reload under a different key fails closed at
+  `inject` with `decrypt_failed`). The file is `0600` and written atomically (temp + fsync + rename)
+  — ADR-008 §4/§6.
+- **Handles never persist.** Only `store` is serialized; the handle table is ephemeral. A restart
+  invalidates every outstanding handle (`unknown_handle` on a pre-restart handle) — persisted
+  single-use handles would be a replay vector (ADR-008 §5).
+- **A corrupt store file refuses to start.** A present-but-unparseable file (bad JSON / unknown
+  version / invalid base64 / wrong-length nonce) aborts `serve` with a non-zero exit and no panic —
+  the store is never silently emptied (ADR-008 §8). A missing file is the normal first-run path.
 - **No engine/backend-specific type crosses the wire** — the contract is plain `vault://`-shaped
   JSON, so a future store backend (encrypted / OpenBao / KMS / HSM) slots in behind it unchanged.

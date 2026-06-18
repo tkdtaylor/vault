@@ -44,9 +44,11 @@ boundary into `exec-sandbox` at execution time, then wiped. vault coordinates wi
 `audit-trail` (handle lifecycle, never the value). The interface is shaped to the
 `vault://<scope>/<key>` scheme + Vault HTTP API path semantics — an adapter seam so a local
 encrypted store, OpenBao, HashiCorp Vault, cloud KMS, or PKCS#11 HSM can sit behind it. vault ships
-an in-memory **AES-256-GCM encrypted-at-rest** store (the key held off the ciphertext, behind a
-backend seam) + a `resolve`/`inject` broker over a uid-restricted Unix-socket IPC server, written in
-Rust for memory safety on the secret path. An **opt-in, loopback-only, read-only HTTP read surface**
+an **AES-256-GCM encrypted-at-rest** store (the key held off the ciphertext, behind a backend seam),
+in-memory by default with an **opt-in `0600` on-disk persistence layer** (`--store-path`, ADR-008 —
+ciphertext-only at rest, key off disk, handles never persist), + a `resolve`/`inject` broker over a
+uid-restricted Unix-socket IPC server, written in Rust for memory safety on the secret path. An
+**opt-in, loopback-only, read-only HTTP read surface**
 (`--http-addr 127.0.0.1:PORT`, ADR-006) speaks the Vault KV-v2 API shape and maps a read onto
 value-free `resolve` — returning the **handle** in a Vault-shaped envelope, never the value.
 
@@ -74,6 +76,17 @@ value-free `resolve` — returning the **handle** in a Vault-shaped envelope, ne
   fails `decrypt_failed` (never a silent wrong value). *(Enforced in `src/crypto.rs` + the
   encrypt-on-put / decrypt-at-inject boundary in `src/vault.rs`; tests `tc001_put_stores_ciphertext_not_plaintext`,
   `tc005_tampered_ciphertext_fails_closed`, `tc006_at_rest_negative_cleartext_absent`; ADR-005.)*
+- **The on-disk store is ciphertext-only, key off disk, handles never persist.** When persistence is
+  enabled (`--store-path PATH`), the store file holds AEAD ciphertext + nonce + non-secret metadata
+  only — the master key and the cleartext are never written (a stolen file is inert without the
+  separately-held key; a reload under a different key fails closed at `inject` with `decrypt_failed`).
+  Only `store` is serialized; **handles never persist**, so a restart invalidates every outstanding
+  handle (`unknown_handle`). The file is `0600`, written atomically (temp + fsync + rename); a corrupt
+  file makes `serve` refuse to start (no panic, store never silently emptied); a missing file is a
+  fresh first-run store. Unset → in-memory only, byte-for-byte today's behavior. *(Enforced in
+  `src/store_file.rs` + `src/vault.rs` load/persist; tests `tc001_restart_round_trips_plaintext`,
+  `tc002_key_never_on_disk_wrong_key_fails_at_inject`, `tc004_handles_do_not_persist`,
+  `tc005_tamper_and_corrupt_fail_closed`; ADR-008.)*
 - **Plaintext crosses only the uid-restricted socket.** The vault→proxy handoff (D5) travels a
   `0600` Unix socket, and every accepted connection is gated by a kernel-verified `SO_PEERCRED`
   peer-uid check — admit iff `peer_uid == server_uid` (equality, not privilege), fail-closed on an
@@ -96,9 +109,12 @@ value-free `resolve` — returning the **handle** in a Vault-shaped envelope, ne
 These are stated as facts about what vault **is not yet**, not as a roadmap (planned work lives in
 `docs/plans/` / `docs/tasks/`):
 
-- **No on-disk persistence.** "Encrypted at rest" means at rest in **process memory** (AES-256-GCM
-  ciphertext, key off the ciphertext — ADR-005); the store is not yet persisted to disk. An on-disk
-  backend can slot behind the `StoreBackend` seam without re-touching the secret path.
+- **On-disk persistence is opt-in, off by default.** Unset `--store-path` ⇒ the store is in-memory
+  only and lost on restart ("encrypted at rest" then means at rest in **process memory**). Set ⇒ the
+  encrypted store persists to a `0600` JSON file (ciphertext + non-secret metadata only; key off
+  disk; handles never persist) loaded on startup and written-through on `put`/`rotate` (ADR-008). The
+  persistence layer is **orthogonal** to the `StoreBackend` value-crypto seam (a `StoreFile`
+  serializer, not a new backend), so a future cloud/KMS/HSM backend composes with it for free.
 - **Not SPIFFE-bound / no cloud-KMS / HSM backends.** These sit behind the `vault://` /
   `StoreBackend` seam but are not built.
 - **Vault-HTTP-API compatibility is a read-only, loopback-only subset, not a drop-in.** vault speaks

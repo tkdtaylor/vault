@@ -110,9 +110,37 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Minimal standard-base64 encoder (no external crate) — the inverse of [`decode_base64`], used by
+/// the on-disk store-file serializer (ADR-008 §2) to render `ciphertext`/`nonce` byte fields as
+/// JSON strings. Emits standard base64 with `=` padding so the output round-trips through
+/// [`decode_base64`] (which strips trailing `=`). No line wrapping.
+pub fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let acc = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((acc >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((acc >> 12) & 0x3f) as usize] as char);
+        if chunk.len() >= 2 {
+            out.push(TABLE[((acc >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() == 3 {
+            out.push(TABLE[(acc & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 /// Minimal standard-base64 decoder (no padding-relaxation, no external crate). `None` on any
 /// invalid char. Accepts optional `=` padding.
-fn decode_base64(s: &str) -> Option<Vec<u8>> {
+pub fn decode_base64(s: &str) -> Option<Vec<u8>> {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let val = |c: u8| -> Option<u32> {
         if c == b'=' {
@@ -307,6 +335,27 @@ mod tests {
             "decrypt_failed",
             "key is external — a different key must not decrypt"
         );
+    }
+
+    /// TC-010 (REQ-009): the new base64 encoder round-trips with `decode_base64` at every length
+    /// mod 3 (the padding boundary), incl. empty, 1-, 2-, 3-byte and long inputs.
+    #[test]
+    fn base64_encoder_round_trips_with_decoder() {
+        let cases: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0x00],
+            vec![0x00, 0xff],
+            vec![0x4d, 0x61, 0x6e],       // "Man" — the canonical 3-byte case
+            vec![0xde, 0xad, 0xbe],       // 3 bytes
+            vec![0xde, 0xad, 0xbe, 0xef], // 4 bytes (1 mod 3)
+            (0u8..=255).collect(),        // full byte range, long input
+            vec![0u8; 12],                // a 12-byte nonce
+        ];
+        for c in cases {
+            let enc = encode_base64(&c);
+            let dec = decode_base64(&enc).expect("encoder output must decode");
+            assert_eq!(dec, c, "round-trip must be exact for {} bytes", c.len());
+        }
     }
 
     #[test]

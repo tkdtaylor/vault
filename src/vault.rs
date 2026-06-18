@@ -12,6 +12,7 @@
 //! The `credential` + `binding` return is the v0→v1 change the tracer-bullet surfaced (A7).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,7 @@ use crate::crypto::{
     random_key, AesGcmBackend, EncryptedValue, EnvKeyProvider, InMemoryKeyProvider, StoreBackend,
 };
 use crate::handle::new_handle;
+use crate::store_file::{self, LoadError, RecordView};
 
 /// Injectable clock seam — lets TTL expiry be tested deterministically without sleeping.
 ///
@@ -128,6 +130,11 @@ pub struct Vault {
     // the trait. `resolve`/`inject`/callers do not change when this swaps. The backend holds the
     // master key (from the key-provider seam) in its own memory — never beside the ciphertext.
     backend: Box<dyn StoreBackend>,
+    // Opt-in persistent store path (ADR-008, REQ-008). `None` ⇒ in-memory only, today's behavior
+    // byte-for-byte (no file read/written). `Some(path)` ⇒ loaded on construction (§7/§8) and
+    // written-through on every `put`/`rotate` (§4). Only `store` is ever persisted — `handles`
+    // never touch disk (§5).
+    store_path: Option<PathBuf>,
 }
 
 impl Default for Vault {
@@ -147,6 +154,14 @@ impl Vault {
     pub fn new() -> Self {
         let backend = production_backend();
         Vault::with_clock_and_backend(Box::new(SystemClock), backend)
+    }
+
+    /// Production **persistent** constructor — wall-clock TTL, AES-256-GCM at-rest backend keyed
+    /// from the environment, with the encrypted store loaded from `path` and written-through on
+    /// every `put`/`rotate` (ADR-008, REQ-008). A missing file is a fresh empty store; a corrupt
+    /// file returns `Err(LoadError)` so `serve` can refuse to start (REQ-004).
+    pub fn new_persistent(path: PathBuf) -> Result<Self, LoadError> {
+        Vault::load_from(path, Box::new(SystemClock), production_backend())
     }
 
     /// Construct with an explicit clock and the production (env-keyed) at-rest backend (task 002
@@ -174,28 +189,96 @@ impl Vault {
 
     /// Construct with an explicit clock **and** an explicit store backend — the seam tests use to
     /// inject a fixed-key AES backend (deterministic) or a non-AES backend (REQ-005 / TC-007).
+    /// In-memory only: no `store_path`, so no file is ever read or written (REQ-008).
     pub fn with_clock_and_backend(clock: Box<dyn Clock>, backend: Box<dyn StoreBackend>) -> Self {
         Vault {
             store: HashMap::new(),
             handles: HashMap::new(),
             clock,
             backend,
+            store_path: None,
         }
     }
 
-    /// Admin: store a secret with its injection floor + binding. The value is **encrypted on put**
-    /// (REQ-001) — the cleartext is not retained in the store after this returns.
+    /// Construct a **persistent** vault: load the encrypted store from `path` on startup, then
+    /// write-through every `put`/`rotate` to it (ADR-008, REQ-001/§7, REQ-008). Ciphertext only is
+    /// loaded — no decryption happens here (decrypt stays at the `inject` edge, §7). The `handles`
+    /// table starts **empty** — handles never persist, so a restart invalidates every outstanding
+    /// handle (§5, REQ-003).
     ///
-    /// Fail-closed: if encryption fails (no key configured, RNG failure), **nothing is stored** for
-    /// this ref — no plaintext fallback. A later `resolve` of an unstored ref returns
-    /// `no_such_secret`; the vault never holds the value in the clear.
-    pub fn put(&mut self, secret_ref: &str, value: &str, floor: Mode, binding: Binding) {
-        let Ok(enc) = self.backend.encrypt(value) else {
+    /// Fail-closed (§8, REQ-004): a **missing** file is a fresh empty store (first run, not an
+    /// error); a **structurally corrupt** file (bad JSON / unknown version / bad base64 /
+    /// wrong-length nonce) returns `Err(LoadError)` so the caller refuses to start — **no panic**,
+    /// the store is never silently emptied.
+    pub fn load_from(
+        path: PathBuf,
+        clock: Box<dyn Clock>,
+        backend: Box<dyn StoreBackend>,
+    ) -> Result<Self, LoadError> {
+        let loaded = store_file::load(&path)?;
+        let mut store = HashMap::with_capacity(loaded.len());
+        for r in loaded {
+            store.insert(
+                r.secret_ref,
+                Secret {
+                    enc: r.enc,
+                    injection_floor: r.injection_floor,
+                    binding: r.binding,
+                    generation: r.generation,
+                },
+            );
+        }
+        Ok(Vault {
+            store,
+            handles: HashMap::new(), // §5: handles NEVER persist — restart starts empty.
+            clock,
+            backend,
+            store_path: Some(path),
+        })
+    }
+
+    /// Serialize the in-memory `store` (ciphertext + non-secret metadata only) to the configured
+    /// `store_path`, atomically and `0600` (ADR-008 §4). A no-op when `store_path` is `None`
+    /// (in-memory mode). Returns `Err(message)` on any I/O failure so the caller can surface
+    /// `store_persist_failed` — never a silent success (REQ-006). Only `store` is written; the
+    /// `handles` table never touches disk (§5).
+    fn persist(&self) -> Result<(), String> {
+        let Some(path) = &self.store_path else {
+            return Ok(()); // in-memory mode — nothing to persist.
+        };
+        let views: Vec<RecordView<'_>> = self
+            .store
+            .iter()
+            .map(|(secret_ref, s)| RecordView {
+                secret_ref,
+                enc: &s.enc,
+                injection_floor: s.injection_floor,
+                binding: &s.binding,
+                generation: s.generation,
+            })
+            .collect();
+        store_file::persist(path, &views)
+    }
+
+    /// Admin: store a secret with its injection floor + binding. The value is **encrypted on put**
+    /// (REQ-001) — the cleartext is not retained in the store after this returns. When a
+    /// `--store-path` is configured the encrypted store is **written-through to disk** atomically
+    /// after the in-memory insert (ADR-008 §4, REQ-007).
+    ///
+    /// Returns `{ok:true}` on success. Fail-closed: if encryption fails (no key configured, RNG
+    /// failure), **nothing is stored** for this ref — no plaintext fallback (`encrypt_failed`). If
+    /// the disk write fails the in-memory insert is **rolled back** and `store_persist_failed` is
+    /// returned — never a silent success that diverges from disk (REQ-006).
+    pub fn put(&mut self, secret_ref: &str, value: &str, floor: Mode, binding: Binding) -> Value {
+        let enc = match self.backend.encrypt(value) {
+            Ok(e) => e,
             // Fail closed: do not store plaintext, do not store a half-secret. The ref simply
             // does not exist until a key-configured put succeeds.
-            return;
+            Err(e) => return err("encrypt_failed", &e),
         };
-        self.store.insert(
+        // Snapshot the prior entry so a persist failure can be rolled back (REQ-006: disk is the
+        // source of truth; we never keep an in-memory write whose persist failed).
+        let prior = self.store.insert(
             secret_ref.to_string(),
             Secret {
                 enc,
@@ -204,6 +287,19 @@ impl Vault {
                 generation: 0,
             },
         );
+        if let Err(e) = self.persist() {
+            // Roll back to exactly the prior state (restore or remove) before surfacing the error.
+            match prior {
+                Some(p) => {
+                    self.store.insert(secret_ref.to_string(), p);
+                }
+                None => {
+                    self.store.remove(secret_ref);
+                }
+            }
+            return err("store_persist_failed", &e);
+        }
+        json!({ "ok": true })
     }
 
     /// Admin: read a secret's metadata — **never the value** (REQ-001 / TC-001).
@@ -259,15 +355,33 @@ impl Vault {
             .store
             .get_mut(secret_ref)
             .expect("ref present (checked above)");
+        // Capture the prior ciphertext + generation so a persist failure rolls back cleanly.
+        let prior_enc = secret.enc.clone();
+        let prior_generation = secret.generation;
         secret.enc = enc;
         // Advance the generation: every handle minted against the prior value is now stale and
         // will be rejected with `handle_invalidated` on inject (rotate-invalidates, ADR-004).
         secret.generation = secret.generation.saturating_add(1);
+        let floor = secret.injection_floor;
+        let binding = secret.binding.clone();
+
+        // Write-through the rotated store (fresh nonce + bumped generation) to disk (ADR-008 §4,
+        // REQ-007). On failure, roll the in-memory entry back to its pre-rotate state and surface
+        // store_persist_failed — never report a rotate as done when its persist failed (REQ-006).
+        if let Err(e) = self.persist() {
+            let secret = self
+                .store
+                .get_mut(secret_ref)
+                .expect("ref present (checked above)");
+            secret.enc = prior_enc;
+            secret.generation = prior_generation;
+            return err("store_persist_failed", &e);
+        }
         json!({
             "ok": true,
             "rotated": true,
-            "injection_floor": secret.injection_floor.as_str(),
-            "binding": secret.binding,
+            "injection_floor": floor.as_str(),
+            "binding": binding,
         })
     }
 
@@ -1237,6 +1351,486 @@ mod tests {
         assert_eq!(inj["delivery"], "proxy");
         assert_eq!(inj["credential"], "SK-SECRET");
         assert_eq!(inj["binding"]["host"], "api.example.com");
+    }
+
+    // --- Task 007: persistent encrypted-on-disk store (TC-001..TC-010) ---
+
+    /// A fixed-key AES-256-GCM backend from an explicit 32-byte key (TC-002 uses two keys).
+    fn backend_with_key(key: [u8; 32]) -> Box<dyn StoreBackend> {
+        Box::new(AesGcmBackend::new(&InMemoryKeyProvider(key)).expect("fixed-key backend"))
+    }
+
+    /// A unique temp directory for a persistence test (cleaned up at the end of each test).
+    fn unique_temp_dir() -> std::path::PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!(
+            "vault-007-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).expect("create temp dir");
+        d
+    }
+
+    /// Build a persistent vault at `path` with a fixed key (system clock). Panics if load fails —
+    /// callers that expect a corrupt-file error use `Vault::load_from` directly.
+    fn persistent_vault(path: &std::path::Path, key: [u8; 32]) -> Vault {
+        Vault::load_from(
+            path.to_path_buf(),
+            Box::new(SystemClock),
+            backend_with_key(key),
+        )
+        .expect("load ok")
+    }
+
+    /// TC-001 (REQ-001): restart round-trip — put, drop+reload from the same path, resolve→inject
+    /// delivers the exact plaintext. Empty and >1-block values both survive. No decrypt at load.
+    #[test]
+    fn tc001_restart_round_trips_plaintext() {
+        let dir = unique_temp_dir();
+        let path = dir.join("store.json");
+        let key = [42u8; 32];
+        for value in ["SK-SECRET", "", &"A".repeat(64)] {
+            // Fresh path per value so each case is independent.
+            let p = dir.join(format!("s-{}.json", value.len()));
+            {
+                let mut v = persistent_vault(&p, key);
+                assert_eq!(
+                    v.put("vault://test/api_key", value, Mode::Proxy, proxy_binding())["ok"],
+                    true
+                );
+                assert!(p.exists(), "put creates the store file");
+            } // drop the vault — simulated restart
+
+            // Reload a FRESH vault from the same path + same key.
+            let mut v2 = persistent_vault(&p, key);
+            let h = v2.resolve("vault://test/api_key", 300)["handle"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let inj = v2.inject(&h, "sbx-1", Some(Mode::Proxy));
+            assert_eq!(
+                inj["credential"], value,
+                "persisted ciphertext decrypts at edge to the exact original"
+            );
+        }
+        let _ = path; // (the loop uses per-length paths)
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TC-002 (REQ-002): the master KEY never appears in the file bytes, and a reload under a
+    /// DIFFERENT key fails closed at inject (`decrypt_failed`) — stolen file is inert. The wrong-key
+    /// load itself does not error (ciphertext-only load); failure is deferred to inject.
+    #[test]
+    fn tc002_key_never_on_disk_wrong_key_fails_at_inject() {
+        let dir = unique_temp_dir();
+        let path = dir.join("store.json");
+        let key = [42u8; 32];
+        {
+            let mut v = persistent_vault(&path, key);
+            v.put(
+                "vault://test/api_key",
+                "SK-SECRET",
+                Mode::Proxy,
+                proxy_binding(),
+            );
+        }
+        // (a) the 32 key bytes appear NOWHERE in the file.
+        let file_bytes = std::fs::read(&path).expect("read store file");
+        assert!(
+            !contains_subslice(&file_bytes, &[42u8; 32]),
+            "master key bytes must never appear in the store file"
+        );
+
+        // (b) reload under a DIFFERENT key — load succeeds (no decrypt at load)…
+        let mut wrong = persistent_vault(&path, [7u8; 32]);
+        // …but inject fails closed.
+        let h = wrong.resolve("vault://test/api_key", 300)["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let inj = wrong.inject(&h, "sbx-1", Some(Mode::Proxy));
+        assert_eq!(
+            inj["error"]["code"], "decrypt_failed",
+            "wrong key ⇒ stolen file is inert"
+        );
+        assert!(
+            inj.get("credential").is_none(),
+            "no credential under wrong key"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TC-003 (REQ-002): the cleartext value never appears in the file bytes.
+    #[test]
+    fn tc003_cleartext_never_on_disk() {
+        let dir = unique_temp_dir();
+        let path = dir.join("store.json");
+        {
+            let mut v = persistent_vault(&path, [42u8; 32]);
+            v.put(
+                "vault://demo/key",
+                "SK-DEMO-DO-NOT-LEAK",
+                Mode::Proxy,
+                proxy_binding(),
+            );
+        }
+        let file_bytes = std::fs::read(&path).expect("read store file");
+        assert!(
+            !contains_subslice(&file_bytes, b"SK-DEMO-DO-NOT-LEAK"),
+            "cleartext value must never appear in the store file"
+        );
+        // Metadata MAY appear in the clear (ADR-008 §3) — sanity: the host is present.
+        assert!(
+            contains_subslice(&file_bytes, b"api.example.com"),
+            "binding metadata is persisted cleartext (per ADR-008 §3)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TC-004 (REQ-003): handles DON'T persist — a pre-restart handle is dead after reload
+    /// (`unknown_handle`), the reloaded handle table is empty, and a fresh resolve works.
+    #[test]
+    fn tc004_handles_do_not_persist() {
+        let dir = unique_temp_dir();
+        let path = dir.join("store.json");
+        let key = [42u8; 32];
+        let pre_handle;
+        {
+            let mut v = persistent_vault(&path, key);
+            v.put(
+                "vault://test/api_key",
+                "SK-SECRET",
+                Mode::Proxy,
+                proxy_binding(),
+            );
+            pre_handle = v.resolve("vault://test/api_key", 300)["handle"]
+                .as_str()
+                .unwrap()
+                .to_string();
+        } // restart
+
+        let mut v2 = persistent_vault(&path, key);
+        assert!(
+            v2.handles.is_empty(),
+            "reloaded handle table must be empty — handles never persist"
+        );
+        let inj = v2.inject(&pre_handle, "sbx-1", Some(Mode::Proxy));
+        assert_eq!(
+            inj["error"]["code"], "unknown_handle",
+            "pre-restart handle is dead after reload"
+        );
+        assert!(inj.get("credential").is_none());
+
+        // A fresh resolve against the reloaded store still works (store intact, handles reset).
+        let h2 = v2.resolve("vault://test/api_key", 300)["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            v2.inject(&h2, "sbx-1", Some(Mode::Proxy))["credential"],
+            "SK-SECRET"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TC-005 (REQ-004): fail-closed on bad input.
+    /// (a) tampered-but-valid ciphertext loads then fails at inject (`decrypt_failed`).
+    /// (b) each structural corruption variant ⇒ load refuses to start (Err, no panic).
+    /// (c) missing file with the path set ⇒ fresh empty store (first run).
+    #[test]
+    fn tc005_tamper_and_corrupt_fail_closed() {
+        let dir = unique_temp_dir();
+        let key = [42u8; 32];
+
+        // (a) tamper a byte inside the base64-decoded ciphertext, re-encode, keep valid JSON.
+        let tpath = dir.join("tamper.json");
+        {
+            let mut v = persistent_vault(&tpath, key);
+            v.put(
+                "vault://test/api_key",
+                "SK-SECRET",
+                Mode::Proxy,
+                proxy_binding(),
+            );
+        }
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&tpath).unwrap()).unwrap();
+        let ct_b64 = doc["records"]["vault://test/api_key"]["ciphertext_b64"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut ct = crate::crypto::decode_base64(&ct_b64).unwrap();
+        ct[0] ^= 0xff; // flip a ciphertext byte
+        doc["records"]["vault://test/api_key"]["ciphertext_b64"] =
+            serde_json::Value::String(crate::crypto::encode_base64(&ct));
+        std::fs::write(&tpath, serde_json::to_vec(&doc).unwrap()).unwrap();
+        let mut vt = persistent_vault(&tpath, key); // structurally valid ⇒ loads fine
+        let h = vt.resolve("vault://test/api_key", 300)["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            vt.inject(&h, "sbx-1", Some(Mode::Proxy))["error"]["code"],
+            "decrypt_failed",
+            "tampered ciphertext fails closed at the edge"
+        );
+
+        // (b) each structural-corruption variant ⇒ refuse to start (Err, no panic).
+        let variants: [&[u8]; 4] = [
+            b"not valid json{",
+            br#"{"version":999,"records":{}}"#,
+            br#"{"version":1,"records":{"r":{"ciphertext_b64":"!!!","nonce_b64":"CQkJCQkJCQkJCQkJ","injection_floor":"proxy","binding":{"host":"h","header":"Authorization","scheme":"Bearer","env_var":"API_KEY"},"generation":0}}}"#,
+            br#"{"version":1,"records":{"r":{"ciphertext_b64":"AQID","nonce_b64":"AA==","injection_floor":"proxy","binding":{"host":"h","header":"Authorization","scheme":"Bearer","env_var":"API_KEY"},"generation":0}}}"#,
+        ];
+        for (i, bytes) in variants.iter().enumerate() {
+            let cpath = dir.join(format!("corrupt-{i}.json"));
+            std::fs::write(&cpath, bytes).unwrap();
+            let r = Vault::load_from(cpath.clone(), Box::new(SystemClock), backend_with_key(key));
+            assert!(
+                r.is_err(),
+                "corruption variant {i} must refuse to start (no partial load)"
+            );
+        }
+
+        // (c) missing file with the path set ⇒ fresh empty store (not an error).
+        let mpath = dir.join("missing.json");
+        assert!(!mpath.exists());
+        let mut vm = persistent_vault(&mpath, key);
+        assert_eq!(vm.list()["secrets"].as_array().unwrap().len(), 0);
+        // The first put creates the file (first-run bootstrap).
+        vm.put(
+            "vault://test/api_key",
+            "SK-SECRET",
+            Mode::Proxy,
+            proxy_binding(),
+        );
+        assert!(mpath.exists(), "first put bootstraps the file");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TC-006 (REQ-005): the persisted store file is `0600`.
+    #[cfg(unix)]
+    #[test]
+    fn tc006_store_file_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir();
+        let path = dir.join("store.json");
+        {
+            let mut v = persistent_vault(&path, [42u8; 32]);
+            v.put(
+                "vault://test/api_key",
+                "SK-SECRET",
+                Mode::Proxy,
+                proxy_binding(),
+            );
+        }
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "persisted file must be 0600");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TC-007 (REQ-006): a failed persist surfaces `store_persist_failed` and leaves the prior
+    /// complete file intact (in-memory mutation rolled back, never a silent success).
+    #[test]
+    fn tc007_failed_persist_is_store_persist_failed_and_atomic() {
+        let dir = unique_temp_dir();
+        let path = dir.join("store.json");
+        let key = [42u8; 32];
+        let mut v = persistent_vault(&path, key);
+        // First put succeeds and writes a complete file.
+        assert_eq!(
+            v.put(
+                "vault://test/api_key",
+                "SK-ONE",
+                Mode::Proxy,
+                proxy_binding()
+            )["ok"],
+            true
+        );
+        let before = std::fs::read(&path).expect("file written");
+
+        // Make the directory unwritable so the temp-file create fails mid-persist.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+            let r = v.put(
+                "vault://test/second",
+                "SK-TWO",
+                Mode::Proxy,
+                proxy_binding(),
+            );
+            assert_eq!(
+                r["error"]["code"], "store_persist_failed",
+                "failed persist must surface store_persist_failed, not a silent success"
+            );
+            // The in-memory write was rolled back — the failed ref is not present.
+            assert_eq!(
+                v.get("vault://test/second")["error"]["code"],
+                "no_such_secret",
+                "failed put is rolled back in memory"
+            );
+            // Restore write perms to inspect the file, which must be the prior complete file.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let after = std::fs::read(&path).expect("prior file intact");
+            assert_eq!(
+                before, after,
+                "prior complete file is unchanged on a failed persist"
+            );
+            // No temp file litters the directory.
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let name = entry.unwrap().file_name();
+                assert!(
+                    !name.to_string_lossy().contains(".tmp."),
+                    "no temp file left behind"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TC-008 (REQ-007): `put` and `rotate` persist; reads do not. After reload the generation is
+    /// bumped, the nonce is fresh, and inject delivers the rotated value.
+    #[test]
+    fn tc008_write_through_on_put_and_rotate_only() {
+        let dir = unique_temp_dir();
+        let path = dir.join("store.json");
+        let key = [42u8; 32];
+
+        let pre_rotate_ct;
+        {
+            let mut v = persistent_vault(&path, key);
+            v.put(
+                "vault://test/api_key",
+                "SK-OLD",
+                Mode::Proxy,
+                proxy_binding(),
+            );
+            pre_rotate_ct = read_record_ct(&path, "vault://test/api_key");
+
+            // Reads must NOT change the file.
+            let snapshot = std::fs::read(&path).unwrap();
+            v.resolve("vault://test/api_key", 300);
+            v.get("vault://test/api_key");
+            v.list();
+            assert_eq!(
+                snapshot,
+                std::fs::read(&path).unwrap(),
+                "resolve/get/list must not write the store file"
+            );
+
+            // rotate persists: generation bumps, nonce is fresh.
+            assert_eq!(v.rotate("vault://test/api_key", "SK-NEW")["ok"], true);
+        } // restart
+
+        let post_rotate_ct = read_record_ct(&path, "vault://test/api_key");
+        assert_ne!(
+            pre_rotate_ct, post_rotate_ct,
+            "rotate persists a fresh nonce ⇒ different ciphertext on disk"
+        );
+
+        // After reload the generation is the bumped one (1) and inject delivers SK-NEW.
+        let mut v2 = persistent_vault(&path, key);
+        // Internal: the reloaded generation reflects the rotate.
+        assert_eq!(
+            v2.store.get("vault://test/api_key").unwrap().generation,
+            1,
+            "bumped generation persisted across reload"
+        );
+        let h = v2.resolve("vault://test/api_key", 300)["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            v2.inject(&h, "sbx-1", Some(Mode::Proxy))["credential"],
+            "SK-NEW"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Helper: read a record's `ciphertext_b64` from the store file as a String.
+    fn read_record_ct(path: &std::path::Path, secret_ref: &str) -> String {
+        let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        doc["records"][secret_ref]["ciphertext_b64"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// TC-009 (REQ-008): opt-in default unchanged — an in-memory vault (no store_path) reads/writes
+    /// no file; put/resolve/inject/rotate behave exactly as today.
+    #[test]
+    fn tc009_opt_in_default_no_file_io() {
+        let dir = unique_temp_dir();
+        // A vault with NO store_path — constructed exactly as the prior 48 tests do.
+        let mut v = test_vault();
+        // No file is created anywhere under a fresh temp dir we never pass in.
+        v.put(
+            "vault://test/api_key",
+            "SK-SECRET",
+            Mode::Proxy,
+            proxy_binding(),
+        );
+        let before: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        let h = v.resolve("vault://test/api_key", 300)["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            v.inject(&h, "sbx-1", Some(Mode::Proxy))["credential"],
+            "SK-SECRET"
+        );
+        v.rotate("vault://test/api_key", "SK-NEW");
+        let after: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert_eq!(before.len(), after.len(), "in-memory vault writes no files");
+        // The persist() no-ops when store_path is None (no panic, returns Ok).
+        assert!(
+            v.persist().is_ok(),
+            "persist is a no-op without a store_path"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TC-010 (REQ-009): types stay wire-free — `Secret`/`EncryptedValue` carry no serde derive;
+    /// serialization goes through the `StoredRecord` DTO. The base64 encoder round-trips with
+    /// `decode_base64` (asserted in `crypto.rs::base64_encoder_round_trips_with_decoder`). Here we
+    /// pin the DTO path: a StoredRecord JSON-serializes and the disk file matches the documented
+    /// shape (version + records + the b64 fields).
+    #[test]
+    fn tc010_dto_shape_and_wire_free_types() {
+        let dir = unique_temp_dir();
+        let path = dir.join("store.json");
+        {
+            let mut v = persistent_vault(&path, [42u8; 32]);
+            v.put(
+                "vault://test/api_key",
+                "SK-SECRET",
+                Mode::Proxy,
+                proxy_binding(),
+            );
+        }
+        let doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(doc["version"], 1, "file carries version:1");
+        let rec = &doc["records"]["vault://test/api_key"];
+        assert!(
+            rec["ciphertext_b64"].is_string(),
+            "ciphertext is base64 string"
+        );
+        assert!(rec["nonce_b64"].is_string(), "nonce is base64 string");
+        assert_eq!(rec["injection_floor"], "proxy");
+        assert_eq!(rec["binding"]["host"], "api.example.com");
+        assert_eq!(rec["generation"], 0);
+        // The nonce_b64 decodes to exactly 12 bytes (the structural check the loader enforces).
+        let nonce = crate::crypto::decode_base64(rec["nonce_b64"].as_str().unwrap()).unwrap();
+        assert_eq!(nonce.len(), 12, "nonce round-trips to 12 bytes");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Naive substring search over bytes (no external crate) for the at-rest negative tests.

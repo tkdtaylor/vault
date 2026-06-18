@@ -7,11 +7,13 @@
 //! Usage:
 //!   vault serve --socket /run/vault.sock                                  # IPC daemon (resolve/inject/put/ping)
 //!   vault serve --socket /run/vault.sock --http-addr 127.0.0.1:8200       # + opt-in loopback HTTP read surface
+//!   vault serve --socket /run/vault.sock --store-path /var/lib/vault.store # + opt-in persistent encrypted store
 //!   vault demo                                                            # run put->resolve->inject in-process
 
 mod crypto;
 mod handle;
 mod http;
+mod store_file;
 mod vault;
 
 use std::fs;
@@ -51,7 +53,40 @@ fn serve(args: &[String]) {
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).ok();
     eprintln!("vault serving on {socket}");
 
-    let v = Arc::new(Mutex::new(Vault::new()));
+    // Opt-in persistent encrypted store (ADR-008). Source precedence: `--store-path` flag wins over
+    // the `VAULT_STORE_PATH` env fallback (mirrors VAULT_MASTER_KEY_FILE/VAULT_MASTER_KEY). Unset ⇒
+    // in-memory only, today's behavior byte-for-byte (no file read/written). Set ⇒ load on startup
+    // and write-through every put/rotate. A corrupt store file refuses to start (non-zero exit, no
+    // panic) — never start with a silently-emptied store.
+    let store_path = resolve_store_path(
+        flag(args, "--store-path").as_deref(),
+        std::env::var("VAULT_STORE_PATH").ok().as_deref(),
+    );
+    let vault = match store_path {
+        Some(path) => {
+            // SEC-003 (defense-in-depth): the 0600 file protects its contents, but a
+            // group/world-writable PARENT directory lets a local attacker play temp-path games.
+            // FIX 1's O_EXCL + O_NOFOLLOW + random suffix already closes the active vector; this is
+            // a non-fatal startup WARNING (never refuse to start, never log a secret) so operators
+            // can tighten the directory posture.
+            warn_if_store_dir_writable(&path);
+            match Vault::new_persistent(path.clone()) {
+                Ok(v) => {
+                    eprintln!("vault persistent store: {}", path.display());
+                    v
+                }
+                Err(e) => {
+                    eprintln!(
+                        "vault: refusing to start — corrupt store file {}: {e}",
+                        path.display()
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => Vault::new(),
+    };
+    let v = Arc::new(Mutex::new(vault));
 
     // Opt-in HTTP read surface (ADR-006). Absent → no TCP listener starts and the Unix socket
     // serves exactly as before (default posture unchanged). Present → a loopback-only, read-only
@@ -140,13 +175,15 @@ fn dispatch(req: &Value, v: &Arc<Mutex<Vault>>) -> Value {
                     env_var: "API_KEY".into(),
                 });
             let floor = parse_mode(&req["injection_floor"]).unwrap_or(Mode::Env);
+            // `put` now returns a structured result: `{ok:true}` on success, or a fail-closed error
+            // (`encrypt_failed` with no key, `store_persist_failed` if the disk write fails — ADR-008
+            // §4). Surface it directly rather than always claiming success.
             v.lock().unwrap().put(
                 req["secret_ref"].as_str().unwrap_or(""),
                 req["value"].as_str().unwrap_or(""),
                 floor,
                 binding,
-            );
-            json!({ "ok": true })
+            )
         }
         Some("get") => v
             .lock()
@@ -204,6 +241,42 @@ fn flag(args: &[String], name: &str) -> Option<String> {
         .position(|a| a == name)
         .and_then(|i| args.get(i + 1).cloned())
 }
+
+/// Resolve the opt-in persistent store path: `--store-path` flag wins over the `VAULT_STORE_PATH`
+/// env fallback; neither set ⇒ `None` (in-memory only). Mirrors the
+/// `VAULT_MASTER_KEY_FILE`/`VAULT_MASTER_KEY` precedence (TC-009, REQ-008). Pure — no env reads, no
+/// I/O — so the precedence is unit-testable without a live `serve`.
+fn resolve_store_path(flag: Option<&str>, env: Option<&str>) -> Option<std::path::PathBuf> {
+    flag.or(env).map(std::path::PathBuf::from)
+}
+
+/// SEC-003 defense-in-depth: if the store file's PARENT directory is group- or world-writable, log
+/// a non-fatal stderr WARNING. We do **not** refuse to start (that could surprise operators, and
+/// FIX 1's O_EXCL/O_NOFOLLOW already closes the active temp-path vector) and we never log a secret —
+/// only the directory path and its mode. A missing/unreadable directory is silently skipped (the
+/// load step surfaces any real problem).
+#[cfg(unix)]
+fn warn_if_store_dir_writable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    if let Ok(meta) = std::fs::metadata(parent) {
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o022 != 0 {
+            eprintln!(
+                "vault: WARNING — store directory {} is group/world-writable (mode {:o}); \
+                 it SHOULD be owned by the vault uid and not group/world-writable (SEC-003)",
+                parent.display(),
+                mode
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_store_dir_writable(_path: &std::path::Path) {}
 
 fn err(code: &str, message: &str) -> Value {
     json!({ "error": { "code": code, "message": message, "retryable": false } })
@@ -304,6 +377,37 @@ mod tests {
         // A well-formed line still works through the same helper — connection survives.
         let ok = handle_line("{\"op\":\"ping\"}", &v);
         assert_eq!(ok["ok"], true);
+    }
+
+    // TC-009 / REQ-008: store-path source precedence — the `--store-path` flag wins over the
+    // `VAULT_STORE_PATH` env fallback; only-env uses the env; neither set ⇒ None (in-memory only).
+    #[test]
+    fn store_path_flag_wins_over_env() {
+        use std::path::PathBuf;
+        // Both set → flag wins.
+        assert_eq!(
+            resolve_store_path(Some("/flag/store.json"), Some("/env/store.json")),
+            Some(PathBuf::from("/flag/store.json")),
+            "flag must win when both --store-path and VAULT_STORE_PATH are set"
+        );
+        // Only env set → env used.
+        assert_eq!(
+            resolve_store_path(None, Some("/env/store.json")),
+            Some(PathBuf::from("/env/store.json")),
+            "env is the fallback when the flag is absent"
+        );
+        // Only flag set → flag used.
+        assert_eq!(
+            resolve_store_path(Some("/flag/store.json"), None),
+            Some(PathBuf::from("/flag/store.json")),
+            "flag alone resolves to the flag path"
+        );
+        // Neither set → None (in-memory only, opt-in default).
+        assert_eq!(
+            resolve_store_path(None, None),
+            None,
+            "neither set ⇒ None (in-memory only)"
+        );
     }
 
     // TC-004 / REQ-004: at the gate, an unreadable peer credential is modeled as `None`, and the
