@@ -27,12 +27,12 @@ is wrong — fix it in the same change.
 
 | File | Covers |
 |------|--------|
-| [behaviors.md](behaviors.md) | What the system does — put, resolve (handle, no value), inject (proxy/env), raise-only floor, single-use binding, fail-closed errors, the IPC server, demo |
+| [behaviors.md](behaviors.md) | What the system does — put, resolve (handle, no value), inject (proxy/env), raise-only floor, single-use binding, fail-closed errors, the IPC server, the opt-in loopback HTTP read surface, demo |
 | [architecture.md](architecture.md) | C4 element catalog — persons, systems, the binary, its components |
 | [data-model.md](data-model.md) | In-memory store + handle table, `Mode`/`Binding`, the resolve/inject wire shapes, error shape |
-| [interfaces.md](interfaces.md) | CLI (`serve`/`demo`), the IPC protocol (`ping`/`put`/`resolve`/`inject`), the `Vault` core methods |
-| [configuration.md](configuration.md) | `--socket`, socket permissions, injection floor / binding defaults, no secrets in repo |
-| [fitness-functions.md](fitness-functions.md) | Proposed executable invariants (zero-knowledge resolve, raise-only floor, single-use, fail-closed, memory-safe path, uid-restricted socket) |
+| [interfaces.md](interfaces.md) | CLI (`serve`/`demo`), the IPC protocol (`ping`/`put`/`resolve`/`inject`), the opt-in loopback HTTP read surface (`/v1/sys/health`, `/v1/secret/data/:path`), the `Vault` core methods |
+| [configuration.md](configuration.md) | `--socket`, `--http-addr` (opt-in, loopback-only), socket permissions, injection floor / binding defaults, no secrets in repo |
+| [fitness-functions.md](fitness-functions.md) | Proposed executable invariants (zero-knowledge resolve, raise-only floor, single-use, fail-closed, memory-safe path, uid-restricted socket, read-only loopback HTTP surface) |
 
 ## Project summary
 
@@ -46,7 +46,9 @@ boundary into `exec-sandbox` at execution time, then wiped. vault coordinates wi
 encrypted store, OpenBao, HashiCorp Vault, cloud KMS, or PKCS#11 HSM can sit behind it. vault ships
 an in-memory **AES-256-GCM encrypted-at-rest** store (the key held off the ciphertext, behind a
 backend seam) + a `resolve`/`inject` broker over a uid-restricted Unix-socket IPC server, written in
-Rust for memory safety on the secret path.
+Rust for memory safety on the secret path. An **opt-in, loopback-only, read-only HTTP read surface**
+(`--http-addr 127.0.0.1:PORT`, ADR-006) speaks the Vault KV-v2 API shape and maps a read onto
+value-free `resolve` — returning the **handle** in a Vault-shaped envelope, never the value.
 
 ## Top-level invariants
 
@@ -77,7 +79,17 @@ Rust for memory safety on the secret path.
   peer-uid check — admit iff `peer_uid == server_uid` (equality, not privilege), fail-closed on an
   unreadable credential, before any op dispatches. *(Enforced in `src/main.rs::handle_conn` /
   `peer_uid_allowed`; ADR-002. Proposed fitness rule F-006.)*
-- **Stable error shape.** IPC and core errors are `{error:{code,message,retryable}}`.
+- **The HTTP read surface is zero-knowledge, read-only, and loopback-only.** When enabled with
+  `--http-addr 127.0.0.1:PORT`, vault exposes a Vault-KV-v2-shaped read (`GET /v1/secret/data/:path`)
+  that maps onto value-free `resolve` and returns the **handle**, never the value, plus a
+  `GET /v1/sys/health` liveness endpoint. No HTTP route reaches `inject`/`put`/`rotate`/`get`/`list`;
+  a non-loopback bind is refused fail-closed; absent the flag there is no HTTP listener. The two
+  listeners are asymmetric: the Unix socket is `SO_PEERCRED`-gated with the full verb set, the HTTP
+  surface is unauthenticated and therefore loopback + read-only. *(Enforced in `src/http.rs`; tests
+  `tc004_read_returns_handle_value_absent`, `tc007_non_get_is_405_mutation_unreachable`,
+  `tc002_loopback_only_accepts_only_127`; ADR-006. Proposed fitness rule F-007.)*
+- **Stable error shape.** IPC and core errors are `{error:{code,message,retryable}}`; the HTTP read
+  surface maps them to Vault's HTTP shapes (`404 {"errors":[]}`, `405`, `400`).
 
 ## Non-goals (current scope)
 
@@ -87,7 +99,12 @@ These are stated as facts about what vault **is not yet**, not as a roadmap (pla
 - **No on-disk persistence.** "Encrypted at rest" means at rest in **process memory** (AES-256-GCM
   ciphertext, key off the ciphertext — ADR-005); the store is not yet persisted to disk. An on-disk
   backend can slot behind the `StoreBackend` seam without re-touching the secret path.
-- **Not SPIFFE-bound / not Vault-HTTP-API-compatible / no cloud-KMS / HSM backends.** These sit
-  behind the `vault://` / `StoreBackend` seam but are not built.
+- **Not SPIFFE-bound / no cloud-KMS / HSM backends.** These sit behind the `vault://` /
+  `StoreBackend` seam but are not built.
+- **Vault-HTTP-API compatibility is a read-only, loopback-only subset, not a drop-in.** vault speaks
+  the Vault KV-v2 read **shape** over an opt-in loopback HTTP surface (ADR-006), but a read returns a
+  **handle**, never the value, and there are **no** HTTP writes (`put`/`rotate`) or value delivery
+  (`inject`) — those stay on the `SO_PEERCRED`-gated Unix socket. Remote (non-loopback) and write
+  compatibility wait on the auth/token model (roadmap row 6, externally blocked).
 - **Not an egress proxy.** vault delivers the credential to the injection edge; the egress proxy
   itself lives in `exec-sandbox`, not here.

@@ -1,6 +1,6 @@
 # Architecture Diagrams — vault
 
-**Last updated:** 2026-06-18 (task 004 — encrypted-at-rest store: AES-256-GCM, key off-ciphertext, ADR-005)
+**Last updated:** 2026-06-18 (task 005 — opt-in loopback HTTP read surface beside the Unix socket, ADR-006)
 
 C4-structured Mermaid diagrams plus the primary runtime sequence. See [overview.md](overview.md)
 for prose context, [decisions/](decisions/) for the ADRs referenced here, and
@@ -57,7 +57,8 @@ C4Component
     Person(operator, "Operator")
 
     Container_Boundary(boundary, "vault binary") {
-        Component(main, "CLI / IPC server", "src/main.rs", "serve & demo subcommands; bind 0600 Unix socket; SO_PEERCRED peer-uid gate (peer_uid_allowed) before dispatch; frame newline-delimited JSON; dispatch ping/put/get/list/rotate/resolve/inject")
+        Component(main, "CLI / IPC server", "src/main.rs", "serve & demo subcommands; bind 0600 Unix socket; SO_PEERCRED peer-uid gate (peer_uid_allowed) before dispatch; frame newline-delimited JSON; dispatch ping/put/get/list/rotate/resolve/inject; opt-in --http-addr starts the HTTP read surface")
+        Component(http, "HTTP read surface", "src/http.rs", "OPT-IN, loopback-only (loopback_only=127.0.0.1, else fail-closed refuse), read-only Vault KV-v2 API shape; GET /v1/sys/health + GET /v1/secret/data/:path -> resolve -> HANDLE in KV-v2 envelope (NEVER the value); fail-closed 405/404/400; NO inject/put/rotate/get/list route; shares the same Arc<Mutex<Vault>>; pure http_route/http_secret_ref/kv2_envelope/http_response_for")
         Component(core, "Vault broker", "src/vault.rs", "store (ciphertext) + handle table; put/get/list/rotate/resolve/inject; encrypt-on-put / decrypt-at-inject; metadata-only admin verbs (never the value); raise-only floor max(secret_floor, requested); single-use + first-use sandbox binding; TTL expiry (now >= expires_at) via injectable Clock; rotate invalidates outstanding handles (per-secret generation); fail-closed errors")
         Component(crypto, "At-rest crypto", "src/crypto.rs", "StoreBackend seam + AES-256-GCM backend; KeyProvider seam (master key off the ciphertext, never logged); fresh 96-bit nonce per put/rotate from /dev/urandom; decrypt fails closed (decrypt_failed)")
         Component(handle, "Handle generator", "src/handle.rs", "32 random bytes from /dev/urandom (OS CSPRNG), hex-encoded; opaque single-use capability token")
@@ -66,11 +67,21 @@ C4Component
     Rel(agent, main, "resolve", "JSON / Unix socket")
     Rel(sandbox, main, "inject", "JSON / Unix socket")
     Rel(operator, main, "serve / demo / put", "CLI")
+    Rel(agent, http, "GET /v1/secret/data/:path", "HTTP / loopback TCP — handle only, opt-in")
+    Rel(main, http, "spawn loopback listener when --http-addr is passed")
     Rel(main, core, "dispatch op -> put/get/list/rotate/resolve/inject")
+    Rel(http, core, "GET read -> resolve (value-free); health = no store access")
     Rel(core, crypto, "encrypt on put/rotate; decrypt on inject (StoreBackend seam)")
     Rel(core, handle, "new_handle() on resolve")
     Rel(core, sandbox, "credential delivered at inject (injection edge)")
 ```
+
+> **Two inbound listeners, asymmetric by design (ADR-006).** The Unix socket is `SO_PEERCRED`-gated
+> and carries the full verb set (including value delivery at `inject`). The HTTP read surface is
+> **opt-in** (`--http-addr`), **loopback-only**, **read-only**, and **unauthenticated** — it maps a
+> Vault KV-v2 read onto value-free `resolve` and returns the **handle**, never the value, and routes
+> nothing to `inject`/`put`/`rotate`/`get`/`list`. The value still crosses **only** the
+> uid-restricted Unix socket at the injection edge.
 
 **Key contracts**
 - `resolve(secret_ref, ttl) -> { handle, ttl, injection_mode }` returns the secret's floor as

@@ -24,8 +24,17 @@ is in-memory).
 | Flag | Subcommand | Type | Default | Required | Effect |
 |------|------------|------|---------|----------|--------|
 | `--socket` | `serve` | string (path) | — | yes (serve) | Unix socket to bind; a stale socket at the path is removed first; bound `0600` |
+| `--http-addr` | `serve` | string (`HOST:PORT`) | — (absent → no HTTP listener) | no | **Opt-in** loopback HTTP read surface (ADR-006). Present → bind a read-only HTTP listener sharing the same `Vault`, but **only if** the host is literal `127.0.0.1`; a non-loopback host is **refused fail-closed** (logged, no bind). Absent → the Unix socket serves exactly as before |
 
 `demo` takes no flags. A missing subcommand or a `serve` without `--socket` → usage error (exit `2`).
+
+**`--http-addr` is loopback-only and fail-closed.** The HTTP read surface (`GET /v1/sys/health`,
+`GET /v1/secret/data/:path`) is zero-knowledge — a read returns the handle in a Vault KV-v2 envelope,
+never the value — and read-only (`inject`/`put`/`rotate`/`get`/`list` are not routed). Because vault
+has no auth/token model yet, the listener binds `127.0.0.1` **only**; a non-loopback `--http-addr`
+(`0.0.0.0`, a LAN IP, `::`, or unparseable) is refused with a logged message and **no bind** — there
+is no operator knob to widen it. Remote exposure waits on the auth model (roadmap row 6). See
+[interfaces.md](interfaces.md) for the endpoints and the error→status mapping.
 
 ---
 
@@ -114,8 +123,8 @@ is an ephemeral in-process value.
 |--------|-------|-------|
 | Artifact | single static Rust binary (`vault`) | `cargo build` → `target/release/vault` |
 | Socket | Unix domain socket at `--socket` path | `chmod 0600` **plus** an `SO_PEERCRED` peer-uid check (admit iff peer uid == server uid); co-located with the agent, not network-exposed |
-| Ports exposed | none | IPC is a Unix socket, not a TCP port |
-| Runtime dependencies | `serde` + `serde_json` + `nix` (socket+user) + `aes-gcm` 0.10.3 (AES-256-GCM) | `nix` supplies `SO_PEERCRED`/`geteuid` for the peer-uid gate (ADR-002); `aes-gcm` 0.10.3 supplies the at-rest AEAD (ADR-005), pinned to the stable line (the 0.11 RC was rejected) and dep-scan-cleared; no `rand` crate (RNG/nonces via `/dev/urandom`); dep-scan / code-scanner are blocking gates for any further crypto change |
+| Ports exposed | none by default; **opt-in** loopback TCP via `--http-addr 127.0.0.1:PORT` | The HTTP read surface (ADR-006) is off unless `--http-addr` is passed, and binds `127.0.0.1` only (a non-loopback bind is refused fail-closed). Read-only + zero-knowledge — never delivers a value |
+| Runtime dependencies | `serde` + `serde_json` + `nix` (socket+user) + `aes-gcm` 0.10.3 (AES-256-GCM) + `tiny_http` 0.12 (HTTP read surface) | `nix` supplies `SO_PEERCRED`/`geteuid` for the peer-uid gate (ADR-002); `aes-gcm` 0.10.3 supplies the at-rest AEAD (ADR-005), pinned to the stable line (the 0.11 RC was rejected) and dep-scan-cleared; `tiny_http` 0.12 (sync, thread-per-connection — no async runtime) supplies the opt-in loopback HTTP read surface (ADR-006), pinned and dep-scan-cleared (tree: `ascii`/`chunked_transfer`/`httpdate`/`log`); no `rand` crate (RNG/nonces via `/dev/urandom`); dep-scan / code-scanner are blocking gates for any further crypto/dependency change |
 | Master key | `VAULT_MASTER_KEY` / `VAULT_MASTER_KEY_FILE` (32 bytes, hex/base64) | required for a production `serve` (store fails closed without it); `demo` uses an ephemeral in-process key |
 
 ---

@@ -234,6 +234,46 @@ points* ([interfaces.md](interfaces.md)).
 - **Failure modes:** none expected on the happy path; the replay step is *expected* to be rejected
   and prints the rejection.
 
+### B-017: Serve an opt-in, loopback-only, read-only HTTP read surface (`--http-addr`)
+
+- **Trigger:** `vault serve --socket <path> --http-addr 127.0.0.1:<port>`.
+- **Response:** **only when `--http-addr` is passed**, the server starts a second listener — a
+  thread-per-connection HTTP server (in the HashiCorp Vault / OpenBao KV-v2 API shape) sharing the
+  **same** `Arc<Mutex<Vault>>` as the Unix socket — but **only if** the host is the literal
+  `127.0.0.1` loopback. Two routes:
+  - `GET /v1/sys/health` → `200 {"initialized":true,"sealed":false}` — liveness only, **no store
+    access**.
+  - `GET /v1/secret/data/:path` → maps the path tail to `vault://:path`, calls `Vault::resolve(…, 300)`,
+    and returns the **handle** in the Vault KV-v2 envelope
+    `{"data":{"data":{"handle":…,"injection_mode":…},"metadata":{"ttl":…}}}` — **never the value**.
+- **Side effects:** binds one loopback TCP port; spawns one OS thread per request. A read mints a
+  single-use handle in the shared handle table (exactly as IPC `resolve` does).
+- **Failure modes:** a **non-loopback** `--http-addr` (`0.0.0.0`, a LAN IP, `::`, unparseable) is
+  **refused fail-closed** — logged to stderr, **no listener bound**, no wildcard exposure; the Unix
+  socket keeps serving. **Absent `--http-addr` → no HTTP listener at all** (the default `serve`
+  posture is unchanged). `inject`/`put`/`rotate`/`get`/`list` are **not routed** over HTTP — there is
+  no method+path that reaches them; value delivery stays on the `SO_PEERCRED`-gated Unix socket.
+  *(Pure decisions `http_route` / `loopback_only` / `kv2_envelope` in `src/http.rs`; tests
+  `tc002_loopback_only_accepts_only_127`, `tc003_health_is_200_liveness_json`,
+  `tc004_read_returns_handle_value_absent`, `shared_vault_put_is_readable_over_http`; ADR-006.)*
+
+### B-018: Fail-closed HTTP read surface — every non-read maps to a Vault error shape
+
+- **Trigger:** any request to the HTTP read surface that is not a routable `GET` read.
+- **Response:** mapped to the Vault HTTP status + body so existing clients see familiar shapes:
+  unknown secret (`no_such_secret`) → `404 {"errors":[]}`; unroutable path / empty `secret/data` tail
+  → `404 {"errors":[]}`; non-GET method (POST/PUT/DELETE/…) → `405 {"errors":["method not allowed"]}`;
+  malformed / over-long request (body over the 8 KiB bound) → `400 {"errors":["bad request"]}`; a
+  handle-mint failure (`rng_error`) → `500 {"errors":["internal error"]}`.
+- **Side effects:** none beyond the response; an over-long body is rejected at/under the bound, never
+  buffered unbounded.
+- **Failure modes:** fail-closed — **no HTTP path, success or error, delivers a secret value.** The
+  only secret-derived datum that crosses the TCP boundary is the opaque handle, on a successful read.
+  Method is decided **before** path read semantics (a POST to a valid read path is still `405`).
+  *(Tests: `tc006_unknown_secret_is_404`, `tc007_non_get_is_405_mutation_unreachable`,
+  `tc008_unroutable_get_is_404_admin_unreachable`, `tc009_request_size_bound_is_named`,
+  `tc010_no_path_leaks_value`; ADR-006.)*
+
 ---
 
 ## Edge cases and error behaviors
@@ -284,3 +324,9 @@ points* ([interfaces.md](interfaces.md)).
   kernel-verified half of the D5 uid restriction (the `0600` mode is the file-mode half).
 - **The value is never logged.** No `put`, `resolve`, `inject`, or error path emits the credential
   to stderr/stdout (except the `inject` delivery itself, which is the injection edge by design).
+- **The HTTP read surface is zero-knowledge, read-only, and loopback-only.** When enabled
+  (`--http-addr 127.0.0.1:PORT`), a read returns the handle in a Vault KV-v2 envelope, never the
+  value; no HTTP route reaches `inject`/`put`/`rotate`/`get`/`list`; a non-loopback bind is refused
+  fail-closed; and absent the flag there is no HTTP listener at all. The two listeners are
+  asymmetric by design: the Unix socket is `SO_PEERCRED`-gated with the full verb set, the HTTP
+  surface is unauthenticated and therefore loopback + read-only (B-017, B-018, ADR-006).
