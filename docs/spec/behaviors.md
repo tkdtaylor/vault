@@ -13,17 +13,21 @@ points* ([interfaces.md](interfaces.md)).
 
 ## Core behaviors
 
-### B-001: Store a secret (admin `put`)
+### B-001: Store a secret (admin `put`) — encrypted at rest
 
 - **Trigger:** `{"op":"put","secret_ref":…,"value":…,"injection_floor":"env|proxy","binding":{…}}`
   over IPC, or `Vault::put(secret_ref, value, floor, binding)` in-process.
-- **Response:** the secret is inserted into the in-memory store keyed by `secret_ref`, carrying its
-  `injection_floor` (the minimum mode any later `inject` may deliver) and its `Binding`. IPC returns
-  `{"ok":true}`.
-- **Side effects:** mutates the in-memory store; nothing is persisted (v0 store is in-memory).
+- **Response:** the value is **AES-256-GCM-encrypted with a fresh 96-bit nonce** and the resulting
+  ciphertext + nonce is inserted into the in-memory store keyed by `secret_ref`, carrying its
+  `injection_floor` (the minimum mode any later `inject` may deliver) and its `Binding`. The
+  **cleartext is not retained** after `put` returns (ADR-005). IPC returns `{"ok":true}`.
+- **Side effects:** mutates the in-memory store (with ciphertext); nothing is persisted to disk.
 - **Failure modes:** an absent `injection_floor` defaults to `env`; an absent/invalid `binding`
   defaults to `{host:"", header:"Authorization", scheme:"Bearer", env_var:"API_KEY"}`. The value
-  is **never** logged or echoed.
+  is **never** logged or echoed. If encryption fails (no master key configured, nonce-RNG failure)
+  the put **fails closed** — nothing is stored for that ref (no plaintext fallback), so a later
+  `resolve` of the unstored ref returns `no_such_secret`. *(Tests:
+  `tc001_put_stores_ciphertext_not_plaintext`, `tc006_at_rest_negative_cleartext_absent`.)*
 
 ### B-012: Read a secret's metadata (admin `get`) — never the value
 
@@ -49,15 +53,18 @@ points* ([interfaces.md](interfaces.md)).
 
 - **Trigger:** `{"op":"rotate","secret_ref":…,"value":…}` over IPC, or `Vault::rotate(secret_ref,
   value)` in-process.
-- **Response:** replaces the stored value **in place**, preserving the secret's `injection_floor`
-  and `binding`, and returns `{ "ok":true, "rotated":true, "injection_floor":…, "binding":{…} }`.
-  **The value is never echoed back** (neither the old nor the new). A subsequent resolve→inject
-  delivers the new value normally.
-- **Side effects:** mutates the stored value and **bumps the secret's generation counter**, which
-  invalidates every handle resolved against the prior value (B-015 / ADR-004).
+- **Response:** **re-encrypts** the new value (AES-256-GCM, **fresh 96-bit nonce** — no reuse with
+  the prior value) and replaces the stored ciphertext **in place**, preserving the secret's
+  `injection_floor` and `binding`, and returns
+  `{ "ok":true, "rotated":true, "injection_floor":…, "binding":{…} }`. **The value is never echoed
+  back** (neither the old nor the new). A subsequent resolve→inject delivers the new value normally.
+- **Side effects:** replaces the stored ciphertext and **bumps the secret's generation counter**,
+  which invalidates every handle resolved against the prior value (B-015 / ADR-004).
 - **Failure modes:** an unknown or empty `secret_ref` → `{error:{code:"no_such_secret",…}}`, nothing
-  rotated. *(Tests: `tc004_rotate_swaps_value_preserves_metadata_no_echo`,
-  `tc005_rotate_invalidates_pre_rotation_handle`, `tc007_no_admin_verb_leaks_value`.)*
+  rotated. A re-encryption failure → `{error:{code:"encrypt_failed",…}}`, the prior ciphertext left
+  untouched. *(Tests: `tc004_rotate_swaps_value_preserves_metadata_no_echo`,
+  `tc005_rotate_invalidates_pre_rotation_handle`, `tc007_no_admin_verb_leaks_value`,
+  `tc004_unique_nonces_no_reuse`.)*
 
 ### B-015: Rotation invalidates pre-rotation handles (fail-closed capability binding)
 
@@ -94,20 +101,26 @@ points* ([interfaces.md](interfaces.md)).
   **pull-triggered push** — exec-sandbox presents `{handle, sandbox_identity}` at spawn.
 - **Response:** validates the handle, rejects it if consumed (B-004) or if its TTL has elapsed
   (B-011), enforces the handle↔sandbox binding (B-004), computes the **effective mode**
-  `max(secret_floor, requested)` (B-005), marks the handle consumed and bound to this sandbox, and
-  delivers the credential **to the injection edge only**:
+  `max(secret_floor, requested)` (B-005), then **decrypts the stored AES-256-GCM ciphertext** — the
+  one and only place the cleartext re-materialises (ADR-005) — marks the handle consumed and bound to
+  this sandbox, and delivers the credential **to the injection edge only**:
   - `proxy` → `{ "ok":true, "delivery":"proxy", "credential":…, "binding":{host,header,scheme,env_var} }`
     — the value goes to exec-sandbox's egress proxy, never into the sandbox. No `wiped_at` is
     present (there is no in-sandbox value to wipe).
   - `env` → `{ "ok":true, "delivery":"env", "credential":…, "var_name":…, "wiped_at":<unix_secs> }`
     — the value is set as the named env var in the sandbox; `wiped_at` is the inject-time clock
     value (the moment the credential is handed to the env-setter), not a placeholder.
+  Decryption happens **before** the handle is marked consumed, so an integrity fault does not burn
+  the single-use handle.
 - **Side effects:** mutates the handle record (`consumed=true`, `bound_sandbox=<sandbox_id>`); the
-  credential crosses only the uid-restricted socket to the injection edge.
-- **Failure modes:** see B-006 (unknown handle, replay, wrong sandbox, expired, rotated) — all fail
-  closed with the structured error shape; no credential delivered. The check order is
-  `unknown_handle → handle_consumed → handle_expired → handle_invalidated → handle_bound_to_other_sandbox → deliver`
-  (B-011, B-015).
+  decrypted credential crosses only the uid-restricted socket to the injection edge.
+- **Failure modes:** see B-006 (unknown handle, replay, wrong sandbox, expired, rotated, **tampered
+  ciphertext**) — all fail closed with the structured error shape; no credential delivered. A stored
+  ciphertext that fails the AES-256-GCM tag check (tampered / truncated / wrong key) →
+  `{error:{code:"decrypt_failed",…}}`, **never a silent wrong value, never a panic** (B-016). The
+  check order is
+  `unknown_handle → handle_consumed → handle_expired → handle_invalidated → handle_bound_to_other_sandbox → decrypt → deliver`
+  (B-011, B-015, B-016). *(Test: `tc002_resolve_inject_round_trips_plaintext`.)*
 
 ### B-004: Enforce single-use + first-use sandbox binding (D5)
 
@@ -149,15 +162,31 @@ points* ([interfaces.md](interfaces.md)).
   *(Tests: `tc002_inject_after_expiry_is_rejected`, `tc002_exactly_at_expiry_is_expired`,
   `tc006_precedence_expired_vs_consumed`; ADR-003.)*
 
+### B-016: Decrypt the stored ciphertext at the edge — fail closed on a bad tag
+
+- **Trigger:** any `inject` that passes the handle checks and reaches delivery — and, on the failure
+  side, any such `inject` whose stored AES-256-GCM ciphertext fails authentication (tampered,
+  truncated, or sealed under a different key).
+- **Response:** on success, the ciphertext is decrypted to the exact original plaintext and delivered
+  as the `credential` (round-trip integrity). On a tag-check failure → `{error:{code:"decrypt_failed",…}}`,
+  **no credential**, **no panic** — never a silent wrong/garbage value. Decryption is the only point
+  the cleartext re-materialises, and it happens at the injection edge, not at `resolve`.
+- **Side effects:** none on failure (the handle is **not** consumed by a failed decrypt); on success,
+  the normal B-003 consume/bind mutation.
+- **Failure modes:** fail-closed — a `decrypt_failed` is a non-delivery terminal state. *(Tests:
+  `tc005_tampered_ciphertext_fails_closed`, `tc002_resolve_inject_round_trips_plaintext`; ADR-005.)*
+
 ### B-006: Reject a malformed, unknown, or unsupported request (fail-closed)
 
 - **Trigger:** a denied peer uid, unparseable JSON, an unknown `op`, an unknown handle, an unknown
-  secret, a consumed handle, an expired handle, a wrong sandbox, or an RNG failure.
+  secret, a consumed handle, an expired handle, a wrong sandbox, a tampered ciphertext, or an RNG
+  failure.
 - **Response:** the structured error shape `{error:{code,message,retryable:false}}`. Codes in use:
   `peer_uid_denied` (peer uid ≠ server uid, or unreadable peer cred — B-010), `bad_request`
   (unparseable JSON), `unknown_op` (unsupported op), `no_such_secret`, `unknown_handle`,
   `handle_consumed`, `handle_expired` (TTL elapsed — B-011), `handle_invalidated` (secret rotated
-  after resolve — B-015), `handle_bound_to_other_sandbox`, `rng_error`.
+  after resolve — B-015), `handle_bound_to_other_sandbox`, `decrypt_failed` (tampered ciphertext —
+  B-016), `encrypt_failed` (rotate re-encryption failure — B-014), `rng_error`.
 - **Side effects:** none; the connection is closed after the single response.
 - **Failure modes:** the caller must treat any `error` response as a non-delivery (fail-closed);
   vault never delivers a credential for a malformed, unknown, or unsupported request.
@@ -240,9 +269,15 @@ points* ([interfaces.md](interfaces.md)).
   metadata (floor, binding, refs) — the secret value appears nowhere in their responses, even for
   values containing JSON-special characters. The value is delivered only on `inject`, to the
   injection edge.
+- **The stored value is ciphertext, decrypted only at the edge.** `put`/`rotate` AES-256-GCM-encrypt
+  the value with a fresh 96-bit nonce; the cleartext is held nowhere at rest. `inject` decrypts at
+  the injection edge — the one point the cleartext re-materialises — and a tampered ciphertext fails
+  `decrypt_failed` (never a silent wrong value). The master key comes from a provider seam and is
+  never stored beside the ciphertext or logged; a missing key fails the store closed. (B-001, B-014,
+  B-016, ADR-005.)
 - **Every non-delivery path fails closed.** A denied peer uid, unknown handle/secret/op, expired
-  handle, malformed request, or RNG failure → the structured error shape; never a delivered
-  credential.
+  handle, tampered ciphertext, malformed request, or RNG failure → the structured error shape; never
+  a delivered credential.
 - **The socket admits only the server's own uid.** Every accepted connection is gated by a
   kernel-verified `SO_PEERCRED` check (`peer_uid == server_uid`, equality not privilege) before any
   op is dispatched; an unreadable peer credential is denied (fail-closed). This is the

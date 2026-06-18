@@ -17,6 +17,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::crypto::{
+    random_key, AesGcmBackend, EncryptedValue, EnvKeyProvider, InMemoryKeyProvider, StoreBackend,
+};
 use crate::handle::new_handle;
 
 /// Injectable clock seam — lets TTL expiry be tested deterministically without sleeping.
@@ -92,7 +95,10 @@ fn default_env_var() -> String {
 }
 
 struct Secret {
-    value: String,
+    // The value at rest: AES-256-GCM ciphertext + its unique nonce (ADR-005). The cleartext is
+    // **never** held here — it exists in plaintext only transiently inside `put`/`rotate` (before
+    // encryption) and at the injection edge (after `inject` decrypts). REQ-001 / REQ-006.
+    enc: EncryptedValue,
     injection_floor: Mode,
     binding: Binding,
     // Bumped on every `rotate`. A handle resolved against generation N is invalidated the moment
@@ -118,6 +124,10 @@ pub struct Vault {
     store: HashMap<String, Secret>,
     handles: HashMap<String, HandleRec>,
     clock: Box<dyn Clock>,
+    // The store-encryption seam (REQ-005): the AES-256-GCM backend in production, swappable behind
+    // the trait. `resolve`/`inject`/callers do not change when this swaps. The backend holds the
+    // master key (from the key-provider seam) in its own memory — never beside the ciphertext.
+    backend: Box<dyn StoreBackend>,
 }
 
 impl Default for Vault {
@@ -127,27 +137,68 @@ impl Default for Vault {
 }
 
 impl Vault {
-    /// Production constructor — wall-clock TTL enforcement.
+    /// Production constructor — wall-clock TTL enforcement, AES-256-GCM at-rest backend keyed from
+    /// the environment ([`EnvKeyProvider`]).
+    ///
+    /// If no master key is configured/readable, the backend is left **unconfigured**: it fails
+    /// closed on every encrypt/decrypt (no plaintext fallback — REQ-003). A `put` then stores
+    /// nothing and a later `inject` returns `decrypt_failed`; the vault never holds or returns a
+    /// plaintext value without a key. Construction itself does not panic.
     pub fn new() -> Self {
-        Vault::with_clock(Box::new(SystemClock))
+        let backend = production_backend();
+        Vault::with_clock_and_backend(Box::new(SystemClock), backend)
     }
 
-    /// Construct with an explicit clock. Tests inject a controllable clock to cross expiry
-    /// boundaries deterministically without sleeping (REQ-005 / TC-005).
+    /// Construct with an explicit clock and the production (env-keyed) at-rest backend (task 002
+    /// API). Since task 004 the at-rest store needs a key, so tests use
+    /// [`with_clock_and_backend`](Self::with_clock_and_backend) to inject a fixed-key backend; this
+    /// env-keyed variant remains the public clock-only constructor.
+    #[allow(dead_code)]
     pub fn with_clock(clock: Box<dyn Clock>) -> Self {
+        Vault::with_clock_and_backend(clock, production_backend())
+    }
+
+    /// Construct with a self-contained **ephemeral** AES-256-GCM backend: a fresh random 32-byte
+    /// key from `/dev/urandom`, held in memory for this process only (never persisted, never
+    /// logged). Used by the `demo` subcommand so it is genuinely encrypted-at-rest without an
+    /// operator-supplied master key. Falls back to the unconfigured (fail-closed) backend only if
+    /// the RNG read fails — never to plaintext.
+    pub fn with_ephemeral_key() -> Self {
+        let backend: Box<dyn StoreBackend> =
+            match random_key().and_then(|k| AesGcmBackend::new(&InMemoryKeyProvider(k))) {
+                Ok(b) => Box::new(b),
+                Err(_) => Box::new(UnconfiguredBackend),
+            };
+        Vault::with_clock_and_backend(Box::new(SystemClock), backend)
+    }
+
+    /// Construct with an explicit clock **and** an explicit store backend — the seam tests use to
+    /// inject a fixed-key AES backend (deterministic) or a non-AES backend (REQ-005 / TC-007).
+    pub fn with_clock_and_backend(clock: Box<dyn Clock>, backend: Box<dyn StoreBackend>) -> Self {
         Vault {
             store: HashMap::new(),
             handles: HashMap::new(),
             clock,
+            backend,
         }
     }
 
-    /// Admin: store a secret with its injection floor + binding.
+    /// Admin: store a secret with its injection floor + binding. The value is **encrypted on put**
+    /// (REQ-001) — the cleartext is not retained in the store after this returns.
+    ///
+    /// Fail-closed: if encryption fails (no key configured, RNG failure), **nothing is stored** for
+    /// this ref — no plaintext fallback. A later `resolve` of an unstored ref returns
+    /// `no_such_secret`; the vault never holds the value in the clear.
     pub fn put(&mut self, secret_ref: &str, value: &str, floor: Mode, binding: Binding) {
+        let Ok(enc) = self.backend.encrypt(value) else {
+            // Fail closed: do not store plaintext, do not store a half-secret. The ref simply
+            // does not exist until a key-configured put succeeds.
+            return;
+        };
         self.store.insert(
             secret_ref.to_string(),
             Secret {
-                value: value.to_string(),
+                enc,
                 injection_floor: floor,
                 binding,
                 generation: 0,
@@ -193,10 +244,22 @@ impl Vault {
     ///
     /// Fail-closed: an unknown or empty `secret_ref` → `no_such_secret`, nothing rotated.
     pub fn rotate(&mut self, secret_ref: &str, value: &str) -> Value {
-        let Some(secret) = self.store.get_mut(secret_ref) else {
+        // The ref must exist before we spend effort encrypting (fail-closed on unknown ref).
+        if !self.store.contains_key(secret_ref) {
             return err("no_such_secret", secret_ref);
+        }
+        // Encrypt the new value with a FRESH nonce (REQ-004 — no reuse with the prior value),
+        // borrowing the backend immutably before we take a mutable borrow on the store entry. A
+        // failed encrypt fails closed: the old ciphertext is left untouched, nothing is rotated.
+        let enc = match self.backend.encrypt(value) {
+            Ok(e) => e,
+            Err(e) => return err("encrypt_failed", &e),
         };
-        secret.value = value.to_string();
+        let secret = self
+            .store
+            .get_mut(secret_ref)
+            .expect("ref present (checked above)");
+        secret.enc = enc;
         // Advance the generation: every handle minted against the prior value is now stale and
         // will be rejected with `handle_invalidated` on inject (rotate-invalidates, ADR-004).
         secret.generation = secret.generation.saturating_add(1);
@@ -290,6 +353,24 @@ impl Vault {
                 effective = m;
             }
         }
+
+        // Decrypt at the injection edge (REQ-002) — the ONLY place the cleartext re-materialises.
+        // Done BEFORE consuming the handle so a tamper/integrity fault (`decrypt_failed`) does not
+        // burn the single-use handle and, critically, never yields a silent wrong value (REQ-004 /
+        // TC-005). A failed decrypt fails closed: no credential, no state mutation.
+        let secret = self.store.get(&secret_ref).expect("secret present");
+        let credential = match self.backend.decrypt(&secret.enc) {
+            Ok(pt) => pt,
+            Err(_) => return err("decrypt_failed", "stored ciphertext failed authentication"),
+        };
+        // Re-read the immutable fields we still need, then consume + bind (single-use, first-use).
+        let secret = self.store.get(&secret_ref).expect("secret present");
+        let binding = secret.binding.clone();
+        let env_var = secret.binding.env_var.clone();
+        let rec = self
+            .handles
+            .get_mut(handle)
+            .expect("handle present (checked above)");
         rec.bound_sandbox = Some(sandbox_id.to_string());
         rec.consumed = true;
         // env-mode auto-wipe timestamp: the moment the credential is handed to the env-setter.
@@ -297,20 +378,41 @@ impl Vault {
         // does not carry a wiped_at (it has no in-sandbox value to wipe).
         let wiped_at = now;
 
-        let secret = self.store.get(&secret_ref).expect("secret present");
         match effective {
             Mode::Proxy => json!({
                 "ok": true, "delivery": "proxy",
-                "credential": secret.value,
-                "binding": secret.binding,
+                "credential": credential,
+                "binding": binding,
             }),
             Mode::Env => json!({
                 "ok": true, "delivery": "env",
-                "credential": secret.value,
-                "var_name": secret.binding.env_var,
+                "credential": credential,
+                "var_name": env_var,
                 "wiped_at": wiped_at,
             }),
         }
+    }
+}
+
+/// Build the production at-rest backend: AES-256-GCM keyed from the environment. If no key is
+/// configured, return an [`UnconfiguredBackend`] that fails closed on every operation — there is no
+/// plaintext fallback (REQ-003). Construction never panics.
+fn production_backend() -> Box<dyn StoreBackend> {
+    match AesGcmBackend::new(&EnvKeyProvider) {
+        Ok(b) => Box::new(b),
+        Err(_) => Box::new(UnconfiguredBackend),
+    }
+}
+
+/// A backend with no usable key: every encrypt/decrypt fails closed. Used when the production vault
+/// starts without a configured master key — the vault holds and returns nothing in the clear.
+struct UnconfiguredBackend;
+impl StoreBackend for UnconfiguredBackend {
+    fn encrypt(&self, _plaintext: &str) -> Result<EncryptedValue, String> {
+        Err("no master key configured".into())
+    }
+    fn decrypt(&self, _value: &EncryptedValue) -> Result<String, String> {
+        Err("no master key configured".into())
     }
 }
 
@@ -325,6 +427,7 @@ fn err(code: &str, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::InMemoryKeyProvider;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
@@ -337,10 +440,21 @@ mod tests {
         }
     }
 
+    /// Build a deterministic fixed-key AES-256-GCM backend for tests (the key is injected via the
+    /// key-provider seam — REQ-003 — so construction never depends on the process environment).
+    fn test_backend() -> Box<dyn StoreBackend> {
+        Box::new(AesGcmBackend::new(&InMemoryKeyProvider([42u8; 32])).expect("fixed-key backend"))
+    }
+
+    /// A test vault with the production system clock and a fixed-key AES backend.
+    fn test_vault() -> Vault {
+        Vault::with_clock_and_backend(Box::new(SystemClock), test_backend())
+    }
+
     /// A vault wired to a controllable clock; returns the shared time handle alongside it.
     fn seeded_at(now: u64) -> (Vault, Arc<AtomicU64>) {
         let t = Arc::new(AtomicU64::new(now));
-        let mut v = Vault::with_clock(Box::new(TestClock(t.clone())));
+        let mut v = Vault::with_clock_and_backend(Box::new(TestClock(t.clone())), test_backend());
         v.put(
             "vault://test/api_key",
             "SK-SECRET",
@@ -356,7 +470,7 @@ mod tests {
     }
 
     fn seeded() -> Vault {
-        let mut v = Vault::new();
+        let mut v = test_vault();
         v.put(
             "vault://test/api_key",
             "SK-SECRET",
@@ -521,7 +635,7 @@ mod tests {
     #[test]
     fn tc004_env_wiped_at_is_real_timestamp() {
         let t = Arc::new(AtomicU64::new(1000));
-        let mut v = Vault::with_clock(Box::new(TestClock(t.clone())));
+        let mut v = Vault::with_clock_and_backend(Box::new(TestClock(t.clone())), test_backend());
         // env floor secret so delivery is env mode.
         v.put(
             "vault://test/env_key",
@@ -685,7 +799,7 @@ mod tests {
         assert!(s.find("SK-SECOND").is_none(), "no value in list");
 
         // Edge: empty store ⇒ empty list, not an error.
-        let empty = Vault::new();
+        let empty = test_vault();
         let er = empty.list();
         assert!(er.get("error").is_none(), "empty store is not an error");
         assert_eq!(er["secrets"].as_array().unwrap().len(), 0);
@@ -695,7 +809,7 @@ mod tests {
     /// resolve→inject delivers the new value. Unknown ref ⇒ no_such_secret.
     #[test]
     fn tc004_rotate_swaps_value_preserves_metadata_no_echo() {
-        let mut v = Vault::new();
+        let mut v = test_vault();
         v.put(
             "vault://test/api_key",
             "SK-OLD",
@@ -732,7 +846,7 @@ mod tests {
     /// value (handle_invalidated, ADR-004). A handle resolved after rotation works normally.
     #[test]
     fn tc005_rotate_invalidates_pre_rotation_handle() {
-        let mut v = Vault::new();
+        let mut v = test_vault();
         v.put(
             "vault://test/api_key",
             "SK-OLD",
@@ -802,7 +916,7 @@ mod tests {
     #[test]
     fn tc007_no_admin_verb_leaks_value() {
         let tricky = r#"SK-"quote"\and{brace}:colon"#;
-        let mut v = Vault::new();
+        let mut v = test_vault();
         v.put(
             "vault://test/api_key",
             tricky,
@@ -834,5 +948,302 @@ mod tests {
                 .is_none(),
             "rotate must not echo the value"
         );
+    }
+
+    // --- Task 004: encrypted-at-rest store (TC-001..TC-007) ---
+
+    /// A proxy binding used by the encryption tests.
+    fn proxy_binding() -> Binding {
+        Binding {
+            host: "api.example.com".into(),
+            header: "Authorization".into(),
+            scheme: "Bearer".into(),
+            env_var: "API_KEY".into(),
+        }
+    }
+
+    /// Return every byte held at rest for a ref: ciphertext bytes followed by the nonce. The
+    /// cleartext must never appear within this (REQ-006). Reaches into the private `Secret` (same
+    /// module) deliberately — the at-rest representation is exactly what an attacker with a memory
+    /// dump of the store would see.
+    fn at_rest_bytes(v: &Vault, secret_ref: &str) -> Vec<u8> {
+        let s = v.store.get(secret_ref).expect("secret present");
+        let mut bytes = s.enc.ciphertext.clone();
+        bytes.extend_from_slice(&s.enc.nonce);
+        bytes
+    }
+
+    /// TC-001 (REQ-001): put stores ciphertext, not plaintext. The cleartext is absent from the
+    /// at-rest bytes; empty and long values both round-trip.
+    #[test]
+    fn tc001_put_stores_ciphertext_not_plaintext() {
+        let mut v = test_vault();
+        v.put(
+            "vault://test/api_key",
+            "SK-SECRET",
+            Mode::Proxy,
+            proxy_binding(),
+        );
+        let rest = at_rest_bytes(&v, "vault://test/api_key");
+        assert!(
+            !contains_subslice(&rest, b"SK-SECRET"),
+            "cleartext must not appear in the at-rest ciphertext"
+        );
+        // The stored representation is non-empty ciphertext (value + 16-byte GCM tag).
+        assert!(!rest.is_empty(), "ciphertext present");
+
+        // Edge: empty value and a >1-block (>16 byte) value both encrypt and round-trip.
+        for val in ["", &"A".repeat(64)] {
+            let mut vv = test_vault();
+            vv.put("vault://test/x", val, Mode::Proxy, proxy_binding());
+            let h = vv.resolve("vault://test/x", 300)["handle"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(
+                vv.inject(&h, "sbx-1", Some(Mode::Proxy))["credential"],
+                val,
+                "empty/long value round-trips"
+            );
+        }
+    }
+
+    /// TC-002 (REQ-002): resolve→inject round-trips the exact plaintext, decrypting only at the
+    /// injection edge; resolve still carries no value. Env-mode delivery also round-trips.
+    #[test]
+    fn tc002_resolve_inject_round_trips_plaintext() {
+        let mut v = test_vault();
+        v.put(
+            "vault://test/api_key",
+            "SK-SECRET",
+            Mode::Proxy,
+            proxy_binding(),
+        );
+        let r = v.resolve("vault://test/api_key", 300);
+        assert!(
+            r.to_string().find("SK-SECRET").is_none(),
+            "resolve carries no value"
+        );
+        let h = r["handle"].as_str().unwrap().to_string();
+        let inj = v.inject(&h, "sbx-1", Some(Mode::Proxy));
+        assert_eq!(
+            inj["credential"], "SK-SECRET",
+            "decrypt at edge yields exact plaintext"
+        );
+
+        // Env-mode delivery round-trips too.
+        let mut ev = test_vault();
+        ev.put("vault://test/env", "SK-ENV", Mode::Env, proxy_binding());
+        let eh = ev.resolve("vault://test/env", 300)["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let einj = ev.inject(&eh, "sbx-1", Some(Mode::Env));
+        assert_eq!(einj["delivery"], "env");
+        assert_eq!(einj["credential"], "SK-ENV");
+    }
+
+    /// TC-003 (REQ-003): the key comes from the provider seam, not stored beside the ciphertext; the
+    /// same key decrypts, a different key fails, and a missing key fails closed (never plaintext).
+    #[test]
+    fn tc003_key_from_provider_seam_not_embedded() {
+        // The fixed key [42;32] is never serialized into the store: scan the at-rest bytes for it.
+        let mut v = test_vault();
+        v.put(
+            "vault://test/api_key",
+            "SK-SECRET",
+            Mode::Proxy,
+            proxy_binding(),
+        );
+        let rest = at_rest_bytes(&v, "vault://test/api_key");
+        assert!(
+            !contains_subslice(&rest, &[42u8; 32]),
+            "key bytes must not appear beside the ciphertext"
+        );
+
+        // Same provider decrypts; a different key cannot (proves the key is external — see the
+        // crypto-module tests `different_key_cannot_decrypt`). Here: an unconfigured vault fails
+        // closed rather than ever returning plaintext.
+        let mut nokey = Vault::with_clock_and_backend(
+            Box::new(SystemClock),
+            Box::new(super::UnconfiguredBackend),
+        );
+        nokey.put(
+            "vault://test/api_key",
+            "SK-SECRET",
+            Mode::Proxy,
+            proxy_binding(),
+        );
+        // put fail-closed: nothing stored without a key → resolve sees no secret.
+        let r = nokey.resolve("vault://test/api_key", 300);
+        assert_eq!(
+            r["error"]["code"], "no_such_secret",
+            "missing key ⇒ fail closed, no plaintext fallback"
+        );
+    }
+
+    /// TC-004 (REQ-004): unique nonce per put/rotation — identical plaintexts produce different
+    /// ciphertexts, and rotation draws a fresh nonce (no reuse with the prior value).
+    #[test]
+    fn tc004_unique_nonces_no_reuse() {
+        let mut v = test_vault();
+        v.put("vault://a", "SK-SAME", Mode::Proxy, proxy_binding());
+        v.put("vault://b", "SK-SAME", Mode::Proxy, proxy_binding());
+        let na = v.store.get("vault://a").unwrap().enc.nonce;
+        let nb = v.store.get("vault://b").unwrap().enc.nonce;
+        let ca = v.store.get("vault://a").unwrap().enc.ciphertext.clone();
+        let cb = v.store.get("vault://b").unwrap().enc.ciphertext.clone();
+        assert_ne!(
+            na, nb,
+            "two puts of identical plaintext use different nonces"
+        );
+        assert_ne!(ca, cb, "identical plaintext ⇒ different ciphertext");
+
+        // Rotation draws a fresh nonce (distinct from the pre-rotation one).
+        let before = v.store.get("vault://a").unwrap().enc.nonce;
+        v.rotate("vault://a", "SK-SAME");
+        let after = v.store.get("vault://a").unwrap().enc.nonce;
+        assert_ne!(before, after, "rotation uses a fresh nonce");
+    }
+
+    /// TC-005 (REQ-004): tampered/truncated ciphertext fails closed with `decrypt_failed` — never a
+    /// silent wrong value, never a panic.
+    #[test]
+    fn tc005_tampered_ciphertext_fails_closed() {
+        // Tamper: flip a ciphertext byte in the store, then resolve→inject.
+        let mut v = test_vault();
+        v.put(
+            "vault://test/api_key",
+            "SK-SECRET",
+            Mode::Proxy,
+            proxy_binding(),
+        );
+        v.store
+            .get_mut("vault://test/api_key")
+            .unwrap()
+            .enc
+            .ciphertext[0] ^= 0xff;
+        let h = v.resolve("vault://test/api_key", 300)["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let inj = v.inject(&h, "sbx-1", Some(Mode::Proxy));
+        assert_eq!(
+            inj["error"]["code"], "decrypt_failed",
+            "bad tag ⇒ fail closed"
+        );
+        assert!(
+            inj.get("credential").is_none(),
+            "no value on decrypt failure"
+        );
+        assert!(inj.get("ok").is_none());
+
+        // Truncation also fails closed.
+        let mut v2 = test_vault();
+        v2.put(
+            "vault://test/api_key",
+            "SK-SECRET",
+            Mode::Proxy,
+            proxy_binding(),
+        );
+        v2.store
+            .get_mut("vault://test/api_key")
+            .unwrap()
+            .enc
+            .ciphertext
+            .truncate(1);
+        let h2 = v2.resolve("vault://test/api_key", 300)["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            v2.inject(&h2, "sbx-1", Some(Mode::Proxy))["error"]["code"],
+            "decrypt_failed",
+            "truncated ciphertext ⇒ fail closed"
+        );
+    }
+
+    /// TC-006 (REQ-001, REQ-006): at-rest negative — the cleartext does not appear anywhere in the
+    /// stored representation (here, the demo placeholder used in `main::demo`).
+    #[test]
+    fn tc006_at_rest_negative_cleartext_absent() {
+        let mut v = test_vault();
+        v.put(
+            "vault://demo/key",
+            "SK-DEMO-DO-NOT-LEAK",
+            Mode::Proxy,
+            proxy_binding(),
+        );
+        // Scan ALL at-rest bytes across the whole store for the cleartext.
+        let mut all = Vec::new();
+        for (_ref, s) in v.store.iter() {
+            all.extend_from_slice(&s.enc.ciphertext);
+            all.extend_from_slice(&s.enc.nonce);
+        }
+        assert!(
+            !contains_subslice(&all, b"SK-DEMO-DO-NOT-LEAK"),
+            "cleartext must be absent from the entire at-rest store"
+        );
+        // And a second cleartext used elsewhere in tests, for good measure.
+        v.put(
+            "vault://test/api_key",
+            "SK-SECRET",
+            Mode::Proxy,
+            proxy_binding(),
+        );
+        let rest = at_rest_bytes(&v, "vault://test/api_key");
+        assert!(!contains_subslice(&rest, b"SK-SECRET"));
+    }
+
+    /// TC-007 (REQ-005): the backend is swappable behind the trait. A non-AES (plaintext-in-memory)
+    /// test backend substitutes behind the seam; `resolve`/`inject` signatures and the contract
+    /// responses are unchanged, and no AEAD type leaks into the response.
+    #[test]
+    fn tc007_backend_is_swappable() {
+        // A second backend used only here: it stores the value bytes verbatim in the `ciphertext`
+        // field (no encryption). It proves the seam — resolve/inject don't know which backend runs.
+        struct PlaintextBackend;
+        impl StoreBackend for PlaintextBackend {
+            fn encrypt(&self, plaintext: &str) -> Result<EncryptedValue, String> {
+                Ok(EncryptedValue {
+                    ciphertext: plaintext.as_bytes().to_vec(),
+                    nonce: [0u8; 12],
+                })
+            }
+            fn decrypt(&self, value: &EncryptedValue) -> Result<String, String> {
+                String::from_utf8(value.ciphertext.clone()).map_err(|_| "decrypt_failed".into())
+            }
+        }
+
+        let mut v =
+            Vault::with_clock_and_backend(Box::new(SystemClock), Box::new(PlaintextBackend));
+        v.put(
+            "vault://test/api_key",
+            "SK-SECRET",
+            Mode::Proxy,
+            proxy_binding(),
+        );
+        // Unchanged contract response shape on resolve…
+        let r = v.resolve("vault://test/api_key", 300);
+        assert_eq!(r["injection_mode"], "proxy");
+        assert!(
+            r.to_string().find("SK-SECRET").is_none(),
+            "resolve value-free"
+        );
+        // …and on inject — exact same fields as the AES backend.
+        let h = r["handle"].as_str().unwrap().to_string();
+        let inj = v.inject(&h, "sbx-1", Some(Mode::Proxy));
+        assert_eq!(inj["ok"], true);
+        assert_eq!(inj["delivery"], "proxy");
+        assert_eq!(inj["credential"], "SK-SECRET");
+        assert_eq!(inj["binding"]["host"], "api.example.com");
+    }
+
+    /// Naive substring search over bytes (no external crate) for the at-rest negative tests.
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        if needle.is_empty() || needle.len() > haystack.len() {
+            return false;
+        }
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 }

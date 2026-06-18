@@ -8,6 +8,7 @@
 //!   vault serve --socket /run/vault.sock          # IPC daemon (resolve/inject/put/ping)
 //!   vault demo                                     # run put->resolve->inject in-process
 
+mod crypto;
 mod handle;
 mod vault;
 
@@ -162,7 +163,10 @@ fn dispatch(req: &Value, v: &Arc<Mutex<Vault>>) -> Value {
 }
 
 fn demo() {
-    let mut v = Vault::new();
+    // Self-contained encrypted-at-rest demo: an ephemeral AES-256-GCM key generated for this
+    // process (no operator key needed). The stored value is ciphertext; `inject` decrypts at the
+    // edge. The demo's placeholder value is an obvious non-secret.
+    let mut v = Vault::with_ephemeral_key();
     v.put(
         "vault://test/api_key",
         "SK-DEMO-DO-NOT-LEAK",
@@ -226,7 +230,9 @@ mod tests {
     // TC-006 / REQ-005: get/list/rotate round-trip through dispatch; unknown op → unknown_op.
     #[test]
     fn admin_verbs_dispatch_and_unknown_op() {
-        let v = Arc::new(Mutex::new(Vault::new()));
+        // Ephemeral-key vault so the at-rest store has a working AES backend in the test process
+        // (no operator master key configured under `cargo test`); assertions are unchanged.
+        let v = Arc::new(Mutex::new(Vault::with_ephemeral_key()));
         // put → get → list → rotate, then an unknown op.
         let put = dispatch(
             &json!({

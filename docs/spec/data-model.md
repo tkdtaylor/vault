@@ -4,7 +4,9 @@
 **Last updated:** 2026-06-18
 
 What data exists, how it's structured, and the wire formats crossing the process boundary. vault
-has **no persistent store** in v0 — all state is in-memory or on the wire.
+has **no on-disk persistence** — all state is in-memory or on the wire. The in-memory store holds
+each secret value as **AES-256-GCM ciphertext** (encrypted at rest in process memory), never
+plaintext; the cleartext re-materialises only at the injection edge (ADR-005).
 
 Not here: operations ([behaviors.md](behaviors.md)), how data is accessed
 ([interfaces.md](interfaces.md)), tunables ([configuration.md](configuration.md)).
@@ -13,26 +15,31 @@ Not here: operations ([behaviors.md](behaviors.md)), how data is accessed
 
 ## Persistent state
 
-**None (v0).** vault holds no database and no files beyond the transient Unix socket it binds. The
-store is in-memory and lost on restart.
-
-> TODO: encrypted-at-rest persistence (AES-256-GCM + age / client-side encryption for store-level
-> zero-knowledge) is a v0 limitation, not yet built (ADR-001 §2 open questions). Today the store is
-> in-memory plaintext.
+**None on disk.** vault holds no database and no files beyond the transient Unix socket it binds.
+The store is in-memory and lost on restart. "Encrypted at rest" here means **at rest in process
+memory** — the value bytes a memory dump would expose are AES-256-GCM ciphertext, not cleartext.
+On-disk persistence can be added behind the same `StoreBackend` seam without re-touching the secret
+path (ADR-005).
 
 ---
 
 ## In-memory state
 
-### State: `Vault.store` — the secret store
+### State: `Vault.store` — the secret store (encrypted at rest)
 
 - **Shape:** `HashMap<String, Secret>` keyed by `secret_ref` (a `vault://<scope>/<key>` string).
-  `Secret { value: String, injection_floor: Mode, binding: Binding, generation: u64 }`
-  (`src/vault.rs`). `generation` starts at `0` on `put` and is bumped on every `rotate`; a handle
-  resolved against generation N is invalidated once the secret advances past N (ADR-004).
-- **Owner:** the `Vault` value (`src/vault.rs`), behind an `Arc<Mutex<Vault>>` in the server.
-- **Lifetime:** process lifetime; populated by `put`, value replaced in place by `rotate`. Not
-  persisted.
+  `Secret { enc: EncryptedValue, injection_floor: Mode, binding: Binding, generation: u64 }`
+  (`src/vault.rs`). The value is held as `EncryptedValue { ciphertext: Vec<u8>, nonce: [u8;12] }` —
+  AES-256-GCM ciphertext (value + appended 128-bit tag) and its unique 96-bit nonce; **the cleartext
+  is never stored** (ADR-005). `generation` starts at `0` on `put` and is bumped on every `rotate`; a
+  handle resolved against generation N is invalidated once the secret advances past N (ADR-004).
+- **Owner:** the `Vault` value (`src/vault.rs`), behind an `Arc<Mutex<Vault>>` in the server. The
+  `Vault` also holds a `Box<dyn StoreBackend>` — the store-encryption seam, `AesGcmBackend` in
+  production — which owns the master key (from the key-provider seam) in its own memory, **never
+  beside the ciphertext**.
+- **Lifetime:** process lifetime; populated by `put` (which **encrypts** the value with a fresh
+  nonce), value replaced in place by `rotate` (which **re-encrypts** with a fresh nonce). Not
+  persisted to disk.
 - **Concurrency rules:** the whole `Vault` is guarded by a `Mutex` in `serve`; each connection
   locks it for the duration of its op.
 - **Bounds:** bounded by the number of secrets `put`.
@@ -89,6 +96,33 @@ struct Binding {
   fns in `src/vault.rs`). `host` has no default (empty string if absent).
 - **Use:** returned in full on a `proxy` inject (`binding`); `env_var` is returned as `var_name` on
   an `env` inject.
+
+### Type: `EncryptedValue` (a secret value at rest)
+
+```
+struct EncryptedValue {
+  ciphertext: Vec<u8>,   // AES-256-GCM ciphertext: value + appended 128-bit auth tag
+  nonce:      [u8; 12],  // the unique 96-bit nonce this value was sealed with
+}
+```
+
+- **Held in:** `Secret.enc` (`src/crypto.rs`). It is the **only** representation of the value the
+  store keeps — the cleartext is never present at rest (ADR-005).
+- **Nonce:** fresh random 96 bits per `put`/`rotate`, drawn from `/dev/urandom` (no `rand` crate).
+  The nonce is not secret and may be stored/transmitted in the clear; the tag authenticates the
+  ciphertext, so tamper/truncation fail closed on decrypt (`decrypt_failed`).
+- **No serde derive** — it never crosses the wire; no AEAD type leaks into a contract response.
+
+### Seam: `KeyProvider` (the master-key source) and `StoreBackend` (the encryption seam)
+
+- **`KeyProvider`** (`src/crypto.rs`): `fn key(&self) -> Result<[u8;32], String>`. The 32-byte
+  AES-256 key is sourced through this seam — **never serialized into the store, never logged**. The
+  production `EnvKeyProvider` reads `VAULT_MASTER_KEY_FILE` (path) or `VAULT_MASTER_KEY` (inline),
+  decoding hex/base64 to exactly 32 bytes; a missing/unreadable key is an error (fail-closed).
+- **`StoreBackend`** (`src/crypto.rs`): `encrypt(&str) -> EncryptedValue`,
+  `decrypt(&EncryptedValue) -> String`. The production `AesGcmBackend` holds the key (from a
+  `KeyProvider`) and does AES-256-GCM. `resolve`/`inject`/callers are unchanged when the backend
+  swaps; an unconfigured key yields a backend that fails closed on every op (no plaintext fallback).
 
 ---
 
@@ -167,6 +201,8 @@ All current errors are `retryable:false`. Codes:
 | `handle_expired` | `false` | `inject` of an unconsumed handle past its TTL (`now >= expires_at`) |
 | `handle_invalidated` | `false` | `inject` of a handle whose secret was rotated after the handle was resolved (generation mismatch — ADR-004); checked after expiry, before binding |
 | `handle_bound_to_other_sandbox` | `false` | `inject` from a sandbox other than the bound one |
+| `decrypt_failed` | `false` | `inject` whose stored ciphertext fails the AES-256-GCM tag check (tampered / truncated / wrong key) — no credential, no panic (ADR-005) |
+| `encrypt_failed` | `false` | `rotate` whose re-encryption fails (e.g. nonce-RNG failure); the prior ciphertext is left untouched (ADR-005) |
 | `rng_error` | `false` | `/dev/urandom` read failure while minting a handle |
 
 ---
@@ -188,5 +224,13 @@ All current errors are `retryable:false`. Codes:
   never delivers the post-rotation value (checked after expiry, before binding — ADR-004).
 - **The admin verbs `get`/`list`/`rotate` are value-free.** Their responses carry only metadata
   (floor, binding, refs); the secret value never appears, including for JSON-special-char values.
+  `get`/`list` never decrypt; `rotate` re-encrypts but never echoes the value.
+- **The value is ciphertext at rest.** `Secret.enc` holds AES-256-GCM ciphertext + nonce, never the
+  cleartext; the cleartext re-materialises only inside `put`/`rotate` (transiently, before
+  encryption) and at `inject` (after decrypt, at the injection edge). A tampered ciphertext fails
+  closed (`decrypt_failed`), never a silent wrong value (ADR-005).
+- **The master key lives off the ciphertext.** The 32-byte AES key is held only in the backend's
+  memory (from the `KeyProvider` seam) — never serialized into the store, never logged. A missing
+  key fails the store closed (no plaintext fallback).
 - **No engine/backend-specific type crosses the wire** — the contract is plain `vault://`-shaped
   JSON, so a future store backend (encrypted / OpenBao / KMS / HSM) slots in behind it unchanged.

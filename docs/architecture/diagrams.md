@@ -1,6 +1,6 @@
 # Architecture Diagrams — vault
 
-**Last updated:** 2026-06-18 (task 003 — get/list/rotate admin verbs + rotate-invalidates-handles, ADR-004)
+**Last updated:** 2026-06-18 (task 004 — encrypted-at-rest store: AES-256-GCM, key off-ciphertext, ADR-005)
 
 C4-structured Mermaid diagrams plus the primary runtime sequence. See [overview.md](overview.md)
 for prose context, [decisions/](decisions/) for the ADRs referenced here, and
@@ -58,7 +58,8 @@ C4Component
 
     Container_Boundary(boundary, "vault binary") {
         Component(main, "CLI / IPC server", "src/main.rs", "serve & demo subcommands; bind 0600 Unix socket; SO_PEERCRED peer-uid gate (peer_uid_allowed) before dispatch; frame newline-delimited JSON; dispatch ping/put/get/list/rotate/resolve/inject")
-        Component(core, "Vault broker", "src/vault.rs", "store + handle table; put/get/list/rotate/resolve/inject; metadata-only admin verbs (never the value); raise-only floor max(secret_floor, requested); single-use + first-use sandbox binding; TTL expiry (now >= expires_at) via injectable Clock; rotate invalidates outstanding handles (per-secret generation); fail-closed errors")
+        Component(core, "Vault broker", "src/vault.rs", "store (ciphertext) + handle table; put/get/list/rotate/resolve/inject; encrypt-on-put / decrypt-at-inject; metadata-only admin verbs (never the value); raise-only floor max(secret_floor, requested); single-use + first-use sandbox binding; TTL expiry (now >= expires_at) via injectable Clock; rotate invalidates outstanding handles (per-secret generation); fail-closed errors")
+        Component(crypto, "At-rest crypto", "src/crypto.rs", "StoreBackend seam + AES-256-GCM backend; KeyProvider seam (master key off the ciphertext, never logged); fresh 96-bit nonce per put/rotate from /dev/urandom; decrypt fails closed (decrypt_failed)")
         Component(handle, "Handle generator", "src/handle.rs", "32 random bytes from /dev/urandom (OS CSPRNG), hex-encoded; opaque single-use capability token")
     }
 
@@ -66,6 +67,7 @@ C4Component
     Rel(sandbox, main, "inject", "JSON / Unix socket")
     Rel(operator, main, "serve / demo / put", "CLI")
     Rel(main, core, "dispatch op -> put/get/list/rotate/resolve/inject")
+    Rel(core, crypto, "encrypt on put/rotate; decrypt on inject (StoreBackend seam)")
     Rel(core, handle, "new_handle() on resolve")
     Rel(core, sandbox, "credential delivered at inject (injection edge)")
 ```
@@ -76,9 +78,12 @@ C4Component
 - `inject(handle, sandbox_id, requested) -> { credential, … }` is the only path the value crosses,
   and only to the injection edge. Effective mode is `max(secret_floor, requested)` — **raise-only**
   (ADR-001 §5). Single-use + first-use sandbox binding (ADR-001 §6).
-- The `vault://<scope>/<key>` scheme is the **backend adapter seam** (ADR-001 §4): the in-memory
-  store can be swapped for an encrypted local store / OpenBao / cloud KMS / HSM behind the same
-  contract, without changing callers.
+- The `vault://<scope>/<key>` scheme is the **backend adapter seam** (ADR-001 §4); inside the binary
+  the **`StoreBackend` trait** (ADR-005) is the store-encryption seam — the default AES-256-GCM
+  backend can be swapped for an OpenBao / cloud KMS / HSM backend without changing `resolve`/`inject`.
+- The stored value is **AES-256-GCM ciphertext at rest** (ADR-005): `put`/`rotate` encrypt with a
+  fresh 96-bit nonce, `inject` decrypts at the edge, and the master key comes from a key-provider
+  seam — never beside the ciphertext. A tampered ciphertext fails `decrypt_failed` (no value).
 - Every unmatched path is **fail-closed** — a structured error, no credential delivered (ADR-001 §8).
 
 ---
@@ -114,15 +119,20 @@ sequenceDiagram
         Vault-->>Sandbox: {"error":{"code":"handle_bound_to_other_sandbox",...}}
     else valid first use
         Vault->>Vault: effective = max(secret_floor, requested)  (raise-only)
-        Vault->>Vault: bound_sandbox = "sbx-1"; consumed = true
-        alt effective == proxy
-            Vault->>Edge: credential + binding{host,header,scheme}
-            Vault-->>Sandbox: {"ok":true,"delivery":"proxy","credential":…,"binding":…}
-            Note over Edge: value goes to the egress proxy ONLY — never into the sandbox
-        else effective == env
-            Vault->>Edge: credential as var_name (e.g. API_KEY)
-            Vault-->>Sandbox: {"ok":true,"delivery":"env","credential":…,"var_name":…,"wiped_at":0}
-            Note over Edge: env-mode auto-wipe (wiped_at) is a placeholder — TTL clock is not yet enforced
+        Vault->>Vault: decrypt AES-256-GCM ciphertext (key from provider seam)
+        alt ciphertext fails tag check (tampered/truncated/wrong key)
+            Vault-->>Sandbox: {"error":{"code":"decrypt_failed",...}}  (no value, handle NOT consumed)
+        else decrypt ok
+            Vault->>Vault: bound_sandbox = "sbx-1"; consumed = true
+            alt effective == proxy
+                Vault->>Edge: credential (decrypted) + binding{host,header,scheme}
+                Vault-->>Sandbox: {"ok":true,"delivery":"proxy","credential":…,"binding":…}
+                Note over Edge: value goes to the egress proxy ONLY — never into the sandbox
+            else effective == env
+                Vault->>Edge: credential (decrypted) as var_name (e.g. API_KEY)
+                Vault-->>Sandbox: {"ok":true,"delivery":"env","credential":…,"var_name":…,"wiped_at":<unix_secs>}
+                Note over Edge: wiped_at = inject-time clock (TTL enforced via injectable Clock, ADR-003)
+            end
         end
     end
 
@@ -135,17 +145,20 @@ The `demo` subcommand exercises this exact flow in-process (put → resolve → 
 replay-rejected) without binding a socket — operator verification of the single-use handle
 invariant.
 
-> TODO (diagrammed honestly): the **wipe** step is partial — env-mode `wiped_at` is a placeholder
-> `0` and there is no TTL auto-wipe clock yet (`src/vault.rs`, ADR-001 §6 note). The
-> **SO_PEERCRED** peer-uid check on the socket is now wired (`src/main.rs::handle_conn`, ADR-002):
-> every accept is admitted only if `peer_uid == server_uid` before dispatch (socket is `0600` *and*
-> kernel-peer-uid-gated).
+> The store is **encrypted at rest** (AES-256-GCM, ADR-005): `put`/`rotate` encrypt the value with a
+> fresh 96-bit nonce before it enters the store, and the decrypt step above is the only place the
+> cleartext re-materialises. The **TTL auto-wipe clock** is enforced (env-mode `wiped_at` is the real
+> inject-time clock, ADR-003), and the **SO_PEERCRED** peer-uid check gates every accept before
+> dispatch (`peer_uid == server_uid`; socket is `0600` *and* kernel-peer-uid-gated, ADR-002).
 
 ADRs governing this flow: [ADR-001](decisions/001-foundational-stack.md) (zero-knowledge resolve,
-raise-only floor, single-use + first-use binding, uid-restricted socket, fail-closed) and
-[ADR-002](decisions/002-socket-peercred-check.md) (kernel-verified SO_PEERCRED peer-uid gate). Future
-evaluator/backend adoptions swap only the store behind the `vault://` seam — this sequence shape,
-the IPC framing, and the handle/binding semantics are preserved.
+raise-only floor, single-use + first-use binding, uid-restricted socket, fail-closed),
+[ADR-002](decisions/002-socket-peercred-check.md) (kernel-verified SO_PEERCRED peer-uid gate),
+[ADR-003](decisions/003-ttl-auto-wipe-clock.md) (TTL expiry / injectable clock),
+[ADR-004](decisions/004-admin-verbs-rotation-invalidation.md) (admin verbs + rotate-invalidation),
+and [ADR-005](decisions/005-encrypted-at-rest-store.md) (AES-256-GCM encrypted-at-rest, key off the
+ciphertext). Future backend adoptions swap only the store behind the `vault://` / `StoreBackend`
+seam — this sequence shape, the IPC framing, and the handle/binding semantics are preserved.
 
 ---
 

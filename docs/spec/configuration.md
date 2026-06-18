@@ -66,7 +66,19 @@ rule F-006.
 
 ## Environment variables
 
-**Application:** none. vault reads no environment variables of its own.
+**Application — the at-rest master key (ADR-005):** the AES-256-GCM store key is sourced from the
+environment via the key-provider seam (`EnvKeyProvider`), in precedence order:
+
+| Var | Type | Effect |
+|-----|------|--------|
+| `VAULT_MASTER_KEY_FILE` | path | File whose contents are the 32-byte master key (hex `64`-char or base64). Takes precedence over the inline var. |
+| `VAULT_MASTER_KEY` | string | The 32-byte master key inline (hex or base64). Used if `…_FILE` is unset. |
+
+The key is decoded to **exactly 32 bytes** (anything else is an error). It is held only in the
+backend's memory — **never serialized into the store, never logged**. A **missing/unreadable/wrong-
+length key fails the store closed**: `put` stores nothing and `inject` returns `decrypt_failed` —
+there is no plaintext fallback. The `demo` subcommand needs **no** key: it generates a self-contained
+ephemeral 32-byte key for the process.
 
 **Hook profile env vars** (consumed by `.claude/scripts/`, not the application):
 - `CLAUDE_HOOK_PROFILE` — `minimal` / `standard` / `strict` (default `standard`)
@@ -83,14 +95,16 @@ a value, and never writes a value to the repo.
 | Secret | Source | Used for |
 |--------|--------|----------|
 | Application credentials (API keys, tokens) | supplied at runtime via the `put` op | minted into single-use handles (`resolve`); delivered to the injection edge (`inject`) |
+| AES-256-GCM master key (32 bytes) | `VAULT_MASTER_KEY` / `VAULT_MASTER_KEY_FILE` (operator-supplied) | encrypts every stored value at rest; held only in backend memory, off the ciphertext (ADR-005) |
 
-> TODO: the v0 store is **in-memory plaintext** — encrypted-at-rest (AES-256-GCM + age /
-> client-side encryption) is not yet built. Until then, vault's process memory is the only
-> protection on the stored value at rest.
+The stored value is **AES-256-GCM ciphertext at rest** (in process memory), decrypted only at the
+injection edge — the master key (above) is the protection on the value at rest, and it lives off the
+ciphertext. There is no on-disk persistence yet.
 
-**Rule:** secrets are never pasted into chat, logged, or written into the repo. The
-`protect-secrets` hook blocks writes to common credential filenames. The demo's `SK-DEMO-DO-NOT-LEAK`
-is an obvious non-secret placeholder.
+**Rule:** secrets — application credentials **and the master key** — are never pasted into chat,
+logged, or written into the repo. The `protect-secrets` hook blocks writes to common credential
+filenames. The demo's `SK-DEMO-DO-NOT-LEAK` is an obvious non-secret placeholder, and the demo's key
+is an ephemeral in-process value.
 
 ---
 
@@ -101,7 +115,8 @@ is an obvious non-secret placeholder.
 | Artifact | single static Rust binary (`vault`) | `cargo build` → `target/release/vault` |
 | Socket | Unix domain socket at `--socket` path | `chmod 0600` **plus** an `SO_PEERCRED` peer-uid check (admit iff peer uid == server uid); co-located with the agent, not network-exposed |
 | Ports exposed | none | IPC is a Unix socket, not a TCP port |
-| Runtime dependencies | `serde` + `serde_json` + `nix` (socket+user; linked-in) | `nix` supplies `SO_PEERCRED`/`geteuid` for the peer-uid gate (ADR-002, dep-scan-cleared); no `rand` crate (RNG via `/dev/urandom`); adding a crypto crate for encrypted-at-rest makes dep-scan / code-scanner blocking gates |
+| Runtime dependencies | `serde` + `serde_json` + `nix` (socket+user) + `aes-gcm` 0.10.3 (AES-256-GCM) | `nix` supplies `SO_PEERCRED`/`geteuid` for the peer-uid gate (ADR-002); `aes-gcm` 0.10.3 supplies the at-rest AEAD (ADR-005), pinned to the stable line (the 0.11 RC was rejected) and dep-scan-cleared; no `rand` crate (RNG/nonces via `/dev/urandom`); dep-scan / code-scanner are blocking gates for any further crypto change |
+| Master key | `VAULT_MASTER_KEY` / `VAULT_MASTER_KEY_FILE` (32 bytes, hex/base64) | required for a production `serve` (store fails closed without it); `demo` uses an ephemeral in-process key |
 
 ---
 

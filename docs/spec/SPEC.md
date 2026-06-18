@@ -43,9 +43,10 @@ boundary into `exec-sandbox` at execution time, then wiped. vault coordinates wi
 (it honors the raise-only `vault_injection_floor`), `exec-sandbox` (the injection edge), and
 `audit-trail` (handle lifecycle, never the value). The interface is shaped to the
 `vault://<scope>/<key>` scheme + Vault HTTP API path semantics — an adapter seam so a local
-encrypted store, OpenBao, HashiCorp Vault, cloud KMS, or PKCS#11 HSM can sit behind it. v0 ships an
-in-memory store + a `resolve`/`inject` broker over a uid-restricted Unix-socket IPC server, written
-in Rust for memory safety on the secret path.
+encrypted store, OpenBao, HashiCorp Vault, cloud KMS, or PKCS#11 HSM can sit behind it. vault ships
+an in-memory **AES-256-GCM encrypted-at-rest** store (the key held off the ciphertext, behind a
+backend seam) + a `resolve`/`inject` broker over a uid-restricted Unix-socket IPC server, written in
+Rust for memory safety on the secret path.
 
 ## Top-level invariants
 
@@ -64,6 +65,13 @@ in Rust for memory safety on the secret path.
   `src/main.rs`. Proposed fitness rule F-004.)*
 - **Memory-safe language for the secret path.** vault is Rust. *(Enforced by the language. Proposed
   fitness rule F-005.)*
+- **Encrypted at rest, key off the ciphertext.** Each stored value is AES-256-GCM ciphertext with a
+  unique 96-bit nonce per `put`/`rotate`; the cleartext is held nowhere at rest and re-materialises
+  only at `inject` (the edge). The 32-byte key comes from a key-provider seam and is never serialized
+  beside the ciphertext or logged; a missing key fails the store closed, and a tampered ciphertext
+  fails `decrypt_failed` (never a silent wrong value). *(Enforced in `src/crypto.rs` + the
+  encrypt-on-put / decrypt-at-inject boundary in `src/vault.rs`; tests `tc001_put_stores_ciphertext_not_plaintext`,
+  `tc005_tampered_ciphertext_fails_closed`, `tc006_at_rest_negative_cleartext_absent`; ADR-005.)*
 - **Plaintext crosses only the uid-restricted socket.** The vault→proxy handoff (D5) travels a
   `0600` Unix socket, and every accepted connection is gated by a kernel-verified `SO_PEERCRED`
   peer-uid check — admit iff `peer_uid == server_uid` (equality, not privilege), fail-closed on an
@@ -71,18 +79,15 @@ in Rust for memory safety on the secret path.
   `peer_uid_allowed`; ADR-002. Proposed fitness rule F-006.)*
 - **Stable error shape.** IPC and core errors are `{error:{code,message,retryable}}`.
 
-## Non-goals (current scope — v0)
+## Non-goals (current scope)
 
 These are stated as facts about what vault **is not yet**, not as a roadmap (planned work lives in
 `docs/plans/` / `docs/tasks/`):
 
-- **Not encrypted-at-rest.** The v0 store is in-memory plaintext — no AES-256-GCM + age /
-  client-side encryption for store-level zero-knowledge yet.
-- **Not TTL-enforcing.** `ttl` is stored on the handle but no auto-wipe clock enforces it
-  (`#[allow(dead_code)] ttl` in `src/vault.rs`; `wiped_at` is a placeholder `0`).
-- **Not fully admin-complete.** Only `put` is wired in the IPC dispatch; `get` / `list` / `rotate`
-  are v1 contract verbs not yet implemented (`src/main.rs::dispatch`).
+- **No on-disk persistence.** "Encrypted at rest" means at rest in **process memory** (AES-256-GCM
+  ciphertext, key off the ciphertext — ADR-005); the store is not yet persisted to disk. An on-disk
+  backend can slot behind the `StoreBackend` seam without re-touching the secret path.
 - **Not SPIFFE-bound / not Vault-HTTP-API-compatible / no cloud-KMS / HSM backends.** These sit
-  behind the `vault://` seam but are not built.
+  behind the `vault://` / `StoreBackend` seam but are not built.
 - **Not an egress proxy.** vault delivers the credential to the injection edge; the egress proxy
   itself lives in `exec-sandbox`, not here.
