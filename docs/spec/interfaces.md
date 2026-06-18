@@ -44,8 +44,11 @@ closes after the response.
 |----|---------|----------|
 | `ping` | `{"op":"ping"}` | `{"ok":true}` |
 | `put` | `{"op":"put","secret_ref":…,"value":…,"injection_floor":"env\|proxy","binding":{…}}` | `{"ok":true}` |
+| `get` | `{"op":"get","secret_ref":…}` | `{"exists":true,"injection_floor":"env\|proxy","binding":{…}}` — **metadata only, never the value**; unknown ref → `{"error":{"code":"no_such_secret",…}}` |
+| `list` | `{"op":"list"}` | `{"secrets":[{"secret_ref":…,"injection_floor":…},…]}` — **never any value**; empty store → `{"secrets":[]}` |
+| `rotate` | `{"op":"rotate","secret_ref":…,"value":…}` | `{"ok":true,"rotated":true,"injection_floor":…,"binding":{…}}` — **value never echoed**; preserves floor+binding; unknown ref → `no_such_secret`. Invalidates outstanding handles for that ref (ADR-004) |
 | `resolve` | `{"op":"resolve","secret_ref":…,"ttl":<sec>}` | `{"handle":…,"ttl":…,"injection_mode":…}` — **never the value** |
-| `inject` | `{"op":"inject","handle":…,"sandbox_identity":{"sandbox_id":…},"mode":"env\|proxy"}` | proxy: `{"ok":true,"delivery":"proxy","credential":…,"binding":{…}}` · env: `{"ok":true,"delivery":"env","credential":…,"var_name":…,"wiped_at":<unix_secs>}` · expired: `{"error":{"code":"handle_expired",...}}` |
+| `inject` | `{"op":"inject","handle":…,"sandbox_identity":{"sandbox_id":…},"mode":"env\|proxy"}` | proxy: `{"ok":true,"delivery":"proxy","credential":…,"binding":{…}}` · env: `{"ok":true,"delivery":"env","credential":…,"var_name":…,"wiped_at":<unix_secs>}` · expired: `{"error":{"code":"handle_expired",...}}` · rotated: `{"error":{"code":"handle_invalidated",...}}` (secret rotated after resolve — ADR-004) |
 | *(peer-uid denied)* | any request from a peer whose uid ≠ the server's | `{"error":{"code":"peer_uid_denied",...}}` — no op dispatched |
 | *(other / malformed)* | any unparseable / unknown op | `{"error":{"code","message","retryable":false}}` (`bad_request` / `unknown_op`) |
 
@@ -56,14 +59,13 @@ closes after the response.
   `0600` mode and the peer-uid assertion are the two halves of the D5 uid restriction (ADR-002).
 - Error codes and the structured error shape are in [data-model.md](data-model.md).
 
-### Contract verbs not yet wired
+### Contract verbs — all four admin verbs wired
 
-The v1 contract (`docs/CONTRACT.md`, the ecosystem's v1 interface contract) defines the admin
-verbs `get | list | rotate` alongside `put`. **As of 2026-06-18 only `put` is dispatched** in
-`src/main.rs::dispatch`:
-
-> TODO: `get` / `list` / `rotate` are v1 contract verbs **not yet implemented** in the IPC
-> dispatch. When wired, they must return **metadata only, never the value** (per the contract).
+The v1 contract (`docs/CONTRACT.md`, the ecosystem's v1 interface contract) defines the admin verbs
+`put | get | list | rotate`. **All four are dispatched** in `src/main.rs::dispatch` and exposed on
+the in-process `Vault` API. `get`/`list`/`rotate` return **metadata only, never the value**;
+`rotate` additionally invalidates outstanding handles for the rotated ref (ADR-004). The remaining
+admin surface (e.g. delete) is not part of the v1 contract.
 
 ---
 
@@ -92,8 +94,11 @@ impl Vault {
     pub fn new() -> Self                                                            // wired to SystemClock
     pub fn with_clock(clock: Box<dyn Clock>) -> Self                                // inject a clock (tests / deterministic expiry)
     pub fn put(&mut self, secret_ref: &str, value: &str, floor: Mode, binding: Binding)
+    pub fn get(&self, secret_ref: &str) -> serde_json::Value                        // { exists, injection_floor, binding } — NOT the value; unknown ref → no_such_secret
+    pub fn list(&self) -> serde_json::Value                                         // { secrets:[{secret_ref, injection_floor},…] } — NOT any value; empty store → []
+    pub fn rotate(&mut self, secret_ref: &str, value: &str) -> serde_json::Value    // replaces value in place, preserves floor+binding, no value echoed; bumps generation (invalidates outstanding handles)
     pub fn resolve(&mut self, secret_ref: &str, ttl: u64) -> serde_json::Value     // { handle, ttl, injection_mode } — NOT the value; records expires_at = now + ttl
-    pub fn inject(&mut self, handle: &str, sandbox_id: &str, requested: Option<Mode>) -> serde_json::Value  // handle_expired if now >= expires_at (after the consumed check)
+    pub fn inject(&mut self, handle: &str, sandbox_id: &str, requested: Option<Mode>) -> serde_json::Value  // handle_consumed → handle_expired → handle_invalidated (rotated) → binding → deliver
 }
 
 // Injectable clock seam — SystemClock in production, a test clock for deterministic expiry.

@@ -124,6 +124,15 @@ fn dispatch(req: &Value, v: &Arc<Mutex<Vault>>) -> Value {
             );
             json!({ "ok": true })
         }
+        Some("get") => v
+            .lock()
+            .unwrap()
+            .get(req["secret_ref"].as_str().unwrap_or("")),
+        Some("list") => v.lock().unwrap().list(),
+        Some("rotate") => v.lock().unwrap().rotate(
+            req["secret_ref"].as_str().unwrap_or(""),
+            req["value"].as_str().unwrap_or(""),
+        ),
         Some("resolve") => {
             let ttl = req["ttl"].as_u64().unwrap_or(300);
             v.lock()
@@ -199,6 +208,60 @@ mod tests {
             peer_uid_allowed(0, 0),
             "(0,0) — root server, root peer — allowed by equality"
         );
+    }
+
+    // --- Task 003: get / list / rotate dispatch (TC-006, TC-007) ---
+
+    // TC-006 / REQ-005: get/list/rotate round-trip through dispatch; unknown op → unknown_op.
+    #[test]
+    fn admin_verbs_dispatch_and_unknown_op() {
+        let v = Arc::new(Mutex::new(Vault::new()));
+        // put → get → list → rotate, then an unknown op.
+        let put = dispatch(
+            &json!({
+                "op":"put","secret_ref":"vault://test/api_key","value":"SK-OLD",
+                "injection_floor":"proxy",
+                "binding":{"host":"api.example.com","header":"Authorization","scheme":"Bearer","env_var":"API_KEY"}
+            }),
+            &v,
+        );
+        assert_eq!(put["ok"], true);
+
+        let got = dispatch(&json!({"op":"get","secret_ref":"vault://test/api_key"}), &v);
+        assert_eq!(got["exists"], true);
+        assert_eq!(got["injection_floor"], "proxy");
+        assert!(
+            got.to_string().find("SK-OLD").is_none(),
+            "get leaks no value"
+        );
+
+        let listed = dispatch(&json!({"op":"list"}), &v);
+        assert_eq!(listed["secrets"].as_array().unwrap().len(), 1);
+        assert!(
+            listed.to_string().find("SK-OLD").is_none(),
+            "list leaks no value"
+        );
+
+        let rotated = dispatch(
+            &json!({"op":"rotate","secret_ref":"vault://test/api_key","value":"SK-NEW"}),
+            &v,
+        );
+        assert_eq!(rotated["ok"], true);
+        assert!(
+            rotated.to_string().find("SK-NEW").is_none(),
+            "rotate echoes no value"
+        );
+
+        // Unknown op still → unknown_op.
+        let unknown = dispatch(&json!({"op":"frobnicate"}), &v);
+        assert_eq!(unknown["error"]["code"], "unknown_op");
+
+        // TC-007 edge: rotate-unknown-ref → no_such_secret.
+        let bad = dispatch(
+            &json!({"op":"rotate","secret_ref":"vault://nope/x","value":"y"}),
+            &v,
+        );
+        assert_eq!(bad["error"]["code"], "no_such_secret");
     }
 
     // TC-004 / REQ-004: at the gate, an unreadable peer credential is modeled as `None`, and the

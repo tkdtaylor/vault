@@ -27,9 +27,12 @@ store is in-memory and lost on restart.
 ### State: `Vault.store` — the secret store
 
 - **Shape:** `HashMap<String, Secret>` keyed by `secret_ref` (a `vault://<scope>/<key>` string).
-  `Secret { value: String, injection_floor: Mode, binding: Binding }` (`src/vault.rs`).
+  `Secret { value: String, injection_floor: Mode, binding: Binding, generation: u64 }`
+  (`src/vault.rs`). `generation` starts at `0` on `put` and is bumped on every `rotate`; a handle
+  resolved against generation N is invalidated once the secret advances past N (ADR-004).
 - **Owner:** the `Vault` value (`src/vault.rs`), behind an `Arc<Mutex<Vault>>` in the server.
-- **Lifetime:** process lifetime; populated by `put`. Not persisted.
+- **Lifetime:** process lifetime; populated by `put`, value replaced in place by `rotate`. Not
+  persisted.
 - **Concurrency rules:** the whole `Vault` is guarded by a `Mutex` in `serve`; each connection
   locks it for the duration of its op.
 - **Bounds:** bounded by the number of secrets `put`.
@@ -38,8 +41,10 @@ store is in-memory and lost on restart.
 
 - **Shape:** `HashMap<String, HandleRec>` keyed by the hex handle string.
   `HandleRec { secret_ref: String, mode: Mode (the secret's floor at resolve time), expires_at: u64,
-  consumed: bool, bound_sandbox: Option<String> }` (`src/vault.rs`). `expires_at` is the absolute
-  Unix-seconds expiry, computed at `resolve` as `clock.now_unix() + ttl` (saturating add).
+  consumed: bool, bound_sandbox: Option<String>, generation: u64 }` (`src/vault.rs`). `expires_at`
+  is the absolute Unix-seconds expiry, computed at `resolve` as `clock.now_unix() + ttl` (saturating
+  add). `generation` is the secret's generation snapshotted at `resolve`; an `inject` whose snapshot
+  ≠ the secret's current generation is rejected `handle_invalidated` (rotation invalidation, ADR-004).
 - **Owner:** the `Vault` value; same `Arc<Mutex<Vault>>`. `Vault` also holds a `Box<dyn Clock>` —
   `SystemClock` in production (`Vault::new`), an injectable test clock via `Vault::with_clock`.
 - **Lifetime:** process lifetime; a record is inserted by `resolve` and mutated (consumed + bound)
@@ -49,7 +54,9 @@ store is in-memory and lost on restart.
 - **Invariant:** a record is **single-use** — `consumed` flips to `true` on the first successful
   `inject` and is never reset; `bound_sandbox` is set on first inject and never re-bound. A record
   is **expired** once `clock.now_unix() >= expires_at` (exactly-at-expiry is expired; `ttl=0` ⇒
-  immediate). On `inject`, the consumed check precedes the expiry check.
+  immediate). A record is **invalidated** once its `generation` ≠ the secret's current generation
+  (the secret was rotated after this handle was resolved — `handle_invalidated`). On `inject`, the
+  check order is consumed → expired → invalidated → binding.
 
 ---
 
@@ -154,10 +161,11 @@ All current errors are `retryable:false`. Codes:
 | `peer_uid_denied` | `false` | accepted connection whose `SO_PEERCRED` peer uid ≠ the server's effective uid, or whose peer credential cannot be read (fail-closed) — no op dispatched |
 | `bad_request` | `false` | unparseable request JSON |
 | `unknown_op` | `false` | an unsupported IPC op |
-| `no_such_secret` | `false` | `resolve` of a `secret_ref` not in the store |
+| `no_such_secret` | `false` | `resolve`, `get`, or `rotate` of a `secret_ref` not in the store |
 | `unknown_handle` | `false` | `inject` of a handle not in the handle table |
 | `handle_consumed` | `false` | `inject` of an already-used handle (replay); checked before expiry |
 | `handle_expired` | `false` | `inject` of an unconsumed handle past its TTL (`now >= expires_at`) |
+| `handle_invalidated` | `false` | `inject` of a handle whose secret was rotated after the handle was resolved (generation mismatch — ADR-004); checked after expiry, before binding |
 | `handle_bound_to_other_sandbox` | `false` | `inject` from a sandbox other than the bound one |
 | `rng_error` | `false` | `/dev/urandom` read failure while minting a handle |
 
@@ -175,5 +183,10 @@ All current errors are `retryable:false`. Codes:
 - **A handle has an absolute expiry.** `expires_at = resolve_time + ttl`; once `now >= expires_at`
   an unconsumed handle is un-injectable (`handle_expired`). The consumed check precedes the expiry
   check, so a consumed+expired handle reports `handle_consumed`.
+- **A handle is bound to the secret's value generation.** A `rotate` bumps the secret's
+  `generation`; a handle resolved against an older generation is rejected `handle_invalidated` and
+  never delivers the post-rotation value (checked after expiry, before binding — ADR-004).
+- **The admin verbs `get`/`list`/`rotate` are value-free.** Their responses carry only metadata
+  (floor, binding, refs); the secret value never appears, including for JSON-special-char values.
 - **No engine/backend-specific type crosses the wire** — the contract is plain `vault://`-shaped
   JSON, so a future store backend (encrypted / OpenBao / KMS / HSM) slots in behind it unchanged.

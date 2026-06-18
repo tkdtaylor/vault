@@ -25,6 +25,55 @@ points* ([interfaces.md](interfaces.md)).
   defaults to `{host:"", header:"Authorization", scheme:"Bearer", env_var:"API_KEY"}`. The value
   is **never** logged or echoed.
 
+### B-012: Read a secret's metadata (admin `get`) — never the value
+
+- **Trigger:** `{"op":"get","secret_ref":…}` over IPC, or `Vault::get(secret_ref)` in-process.
+- **Response:** returns `{ "exists":true, "injection_floor":"env|proxy", "binding":{host,header,scheme,env_var} }`
+  for a stored secret. **The value is never in the response** — only its floor and binding metadata.
+- **Side effects:** none (read-only).
+- **Failure modes:** an unknown or empty `secret_ref` → `{error:{code:"no_such_secret",…}}`, no
+  metadata and no value. *(Tests: `tc001_get_returns_metadata_not_value`,
+  `tc002_get_unknown_ref_is_fail_closed`.)*
+
+### B-013: List stored secret refs (admin `list`) — never any value
+
+- **Trigger:** `{"op":"list"}` over IPC, or `Vault::list()` in-process.
+- **Response:** returns `{ "secrets":[ {"secret_ref":…, "injection_floor":…}, … ] }` — one entry per
+  stored secret, carrying the ref and its floor. **No value appears.** Ordering is unspecified
+  (HashMap iteration).
+- **Side effects:** none (read-only).
+- **Failure modes:** an empty store returns `{"secrets":[]}` — an empty list, **not** an error.
+  *(Test: `tc003_list_returns_refs_no_values`.)*
+
+### B-014: Rotate a secret's value in place (admin `rotate`) — invalidates outstanding handles
+
+- **Trigger:** `{"op":"rotate","secret_ref":…,"value":…}` over IPC, or `Vault::rotate(secret_ref,
+  value)` in-process.
+- **Response:** replaces the stored value **in place**, preserving the secret's `injection_floor`
+  and `binding`, and returns `{ "ok":true, "rotated":true, "injection_floor":…, "binding":{…} }`.
+  **The value is never echoed back** (neither the old nor the new). A subsequent resolve→inject
+  delivers the new value normally.
+- **Side effects:** mutates the stored value and **bumps the secret's generation counter**, which
+  invalidates every handle resolved against the prior value (B-015 / ADR-004).
+- **Failure modes:** an unknown or empty `secret_ref` → `{error:{code:"no_such_secret",…}}`, nothing
+  rotated. *(Tests: `tc004_rotate_swaps_value_preserves_metadata_no_echo`,
+  `tc005_rotate_invalidates_pre_rotation_handle`, `tc007_no_admin_verb_leaks_value`.)*
+
+### B-015: Rotation invalidates pre-rotation handles (fail-closed capability binding)
+
+- **Trigger:** any `inject` against a handle that was resolved **before** a `rotate` of its secret.
+- **Response:** the handle is rejected with `{error:{code:"handle_invalidated",…}}`, **no credential
+  delivered** — a pre-rotation handle can never inject the post-rotation value. A handle resolved
+  **after** the rotation injects the new value normally. Mechanism: each `Secret` carries a
+  monotonic `generation` (bumped on every `rotate`); each handle snapshots that generation at
+  `resolve` time; `inject` rejects a handle whose snapshot ≠ the secret's current generation.
+- **Precedence:** the invalidation check runs **after** the consumed and expired checks and
+  **before** the sandbox-binding check —
+  `unknown_handle → handle_consumed → handle_expired → handle_invalidated → handle_bound_to_other_sandbox → deliver`.
+- **Side effects:** none on rejection; no state mutation, no credential.
+- **Failure modes:** fail-closed — a rotated-out handle is a non-delivery terminal state, no retry.
+  *(Test: `tc005_rotate_invalidates_pre_rotation_handle`; ADR-004.)*
+
 ### B-002: Resolve a secret to a handle — never the value (zero-knowledge)
 
 - **Trigger:** `{"op":"resolve","secret_ref":…,"ttl":<seconds>}` over IPC, or
@@ -55,10 +104,10 @@ points* ([interfaces.md](interfaces.md)).
     value (the moment the credential is handed to the env-setter), not a placeholder.
 - **Side effects:** mutates the handle record (`consumed=true`, `bound_sandbox=<sandbox_id>`); the
   credential crosses only the uid-restricted socket to the injection edge.
-- **Failure modes:** see B-006 (unknown handle, replay, wrong sandbox, expired) — all fail closed
-  with the structured error shape; no credential delivered. The check order is
-  `unknown_handle → handle_consumed → handle_expired → handle_bound_to_other_sandbox → deliver`
-  (B-011).
+- **Failure modes:** see B-006 (unknown handle, replay, wrong sandbox, expired, rotated) — all fail
+  closed with the structured error shape; no credential delivered. The check order is
+  `unknown_handle → handle_consumed → handle_expired → handle_invalidated → handle_bound_to_other_sandbox → deliver`
+  (B-011, B-015).
 
 ### B-004: Enforce single-use + first-use sandbox binding (D5)
 
@@ -107,8 +156,8 @@ points* ([interfaces.md](interfaces.md)).
 - **Response:** the structured error shape `{error:{code,message,retryable:false}}`. Codes in use:
   `peer_uid_denied` (peer uid ≠ server uid, or unreadable peer cred — B-010), `bad_request`
   (unparseable JSON), `unknown_op` (unsupported op), `no_such_secret`, `unknown_handle`,
-  `handle_consumed`, `handle_expired` (TTL elapsed — B-011), `handle_bound_to_other_sandbox`,
-  `rng_error`.
+  `handle_consumed`, `handle_expired` (TTL elapsed — B-011), `handle_invalidated` (secret rotated
+  after resolve — B-015), `handle_bound_to_other_sandbox`, `rng_error`.
 - **Side effects:** none; the connection is closed after the single response.
 - **Failure modes:** the caller must treat any `error` response as a non-delivery (fail-closed);
   vault never delivers a credential for a malformed, unknown, or unsupported request.
@@ -184,6 +233,13 @@ points* ([interfaces.md](interfaces.md)).
 - **A handle expires.** Past its TTL (`now >= expires_at`, set as `resolve_time + ttl`) an unconsumed
   handle is rejected with `handle_expired` and delivers nothing; a consumed handle reports
   `handle_consumed` first (consumed-before-expired precedence).
+- **Rotation invalidates outstanding handles.** A handle resolved before a `rotate` of its secret is
+  rejected with `handle_invalidated` and never delivers the post-rotation value; a handle resolved
+  after the rotation works normally. (Per-secret generation counter — B-015, ADR-004.)
+- **The admin read/rotate verbs never expose the value.** `get`, `list`, and `rotate` return only
+  metadata (floor, binding, refs) — the secret value appears nowhere in their responses, even for
+  values containing JSON-special characters. The value is delivered only on `inject`, to the
+  injection edge.
 - **Every non-delivery path fails closed.** A denied peer uid, unknown handle/secret/op, expired
   handle, malformed request, or RNG failure → the structured error shape; never a delivered
   credential.
