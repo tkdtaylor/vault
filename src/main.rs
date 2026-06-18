@@ -79,11 +79,22 @@ fn handle_conn(mut stream: UnixStream, v: Arc<Mutex<Vault>>) {
     if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
         return;
     }
-    let resp = match serde_json::from_str::<Value>(&line) {
-        Ok(req) => dispatch(&req, &v),
-        Err(e) => err("bad_request", &e.to_string()),
-    };
+    let resp = handle_line(&line, &v);
     let _ = writeln!(stream, "{resp}");
+}
+
+/// Parse one newline-delimited JSON request line and route it to `dispatch`.
+///
+/// Fail-closed ingress (TC-006): a line that is not well-formed JSON yields a structured
+/// `bad_request` error rather than a panic or a dropped connection — `handle_conn` writes the
+/// response back and the connection survives. Behaviour is identical to the inlined match it
+/// replaced; this is a pure extraction so the parse→dispatch step is unit-testable without a
+/// live socket. The SO_PEERCRED peer-uid gate stays upstream in `handle_conn`, unchanged.
+fn handle_line(line: &str, v: &Arc<Mutex<Vault>>) -> Value {
+    match serde_json::from_str::<Value>(line) {
+        Ok(req) => dispatch(&req, v),
+        Err(e) => err("bad_request", &e.to_string()),
+    }
 }
 
 /// Read the connecting peer's uid from the kernel via `SO_PEERCRED`.
@@ -262,6 +273,19 @@ mod tests {
             &v,
         );
         assert_eq!(bad["error"]["code"], "no_such_secret");
+    }
+
+    // TC-006 edge: a malformed JSON request line → structured `bad_request`, and a well-formed
+    // line still routes normally — so the fail-closed ingress path is exercised and "connection
+    // survives" (the helper returns a response Value rather than closing/panicking).
+    #[test]
+    fn malformed_json_line_is_bad_request() {
+        let v = Arc::new(Mutex::new(Vault::new()));
+        let bad = handle_line("not valid json{", &v);
+        assert_eq!(bad["error"]["code"], "bad_request");
+        // A well-formed line still works through the same helper — connection survives.
+        let ok = handle_line("{\"op\":\"ping\"}", &v);
+        assert_eq!(ok["ok"], true);
     }
 
     // TC-004 / REQ-004: at the gate, an unreadable peer credential is modeled as `None`, and the
