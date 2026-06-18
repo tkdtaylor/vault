@@ -13,7 +13,7 @@
 | Task ID | Feature | Spec file | Tests written | Status | Verified by |
 |---------|---------|-----------|---------------|--------|-------------|
 | 001 | SO_PEERCRED peer-uid check on the Unix socket | `001-socket-peercred-check-test-spec.md` | TC-001…TC-005 | ✅ | L6: same-uid `serve` round-trip observed (ping/put/resolve over live socket) + L2 unit tests (`peer_uid_allowed_is_equality_not_privilege`, `unreadable_peer_cred_is_denied`); different-uid rejection unit-proven (no 2nd uid in env) |
-| 002 | TTL auto-wipe clock (enforce handle TTL + env wiped_at) | `002-ttl-auto-wipe-test-spec.md` | TC-001…TC-006 | 🟡 | L2: `test result: ok. 15 passed; 0 failed` (TC-001 `tc001_*`, TC-002 `tc002_*`, TC-003 `tc003_*`, TC-004 `tc004_*`, TC-005 `tc005_default_clock_is_system_clock`, TC-006 `tc006_precedence_expired_vs_consumed`) + L6: live socket `resolve ttl=1` → wait 2s → `inject` → `handle_expired` observed; awaiting spec-verifier |
+| 002 | TTL auto-wipe clock (enforce handle TTL + env wiped_at) | `002-ttl-auto-wipe-test-spec.md` | TC-001…TC-006 | ✅ | L5: `test result: ok. 15 passed; 0 failed` (TC-001..006 via injected clock, no sleep) + L6: live socket `resolve ttl=1` → wait 2s → `inject` → `handle_expired`; spec-verifier APPROVE (per-assertion TC-001..006) |
 | 003 | Wire get/list/rotate admin verbs (metadata-only) | `003-admin-verbs-get-list-rotate-test-spec.md` | TC-001…TC-007 | ❌ | pending — backlog |
 | 004 | Encrypted-at-rest store (AES-256-GCM, key off-ciphertext) | `004-encrypted-at-rest-store-test-spec.md` | TC-001…TC-007 | ❌ | pending — backlog |
 
