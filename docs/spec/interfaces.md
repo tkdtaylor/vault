@@ -48,7 +48,7 @@ closes after the response.
 | `list` | `{"op":"list"}` | `{"secrets":[{"secret_ref":…,"injection_floor":…},…]}` — **never any value**; empty store → `{"secrets":[]}` |
 | `rotate` | `{"op":"rotate","secret_ref":…,"value":…}` | `{"ok":true,"rotated":true,"injection_floor":…,"binding":{…}}` — **value never echoed**; preserves floor+binding; unknown ref → `no_such_secret`. Invalidates outstanding handles for that ref (ADR-004) |
 | `resolve` | `{"op":"resolve","secret_ref":…,"ttl":<sec>}` | `{"handle":…,"ttl":…,"injection_mode":…}` — **never the value** |
-| `inject` | `{"op":"inject","handle":…,"sandbox_identity":{"sandbox_id":…},"mode":"env\|proxy"}` | proxy: `{"ok":true,"delivery":"proxy","credential":…,"binding":{…}}` · env: `{"ok":true,"delivery":"env","credential":…,"var_name":…,"wiped_at":<unix_secs>}` · expired: `{"error":{"code":"handle_expired",...}}` · rotated: `{"error":{"code":"handle_invalidated",...}}` (secret rotated after resolve — ADR-004) |
+| `inject` | `{"op":"inject","handle":…,"sandbox_identity":{"sandbox_id":…},"mode":"env\|proxy"}` | proxy: `{"ok":true,"delivery":"proxy","credential":…,"binding":{…}}` · env: `{"ok":true,"delivery":"env","credential":…,"var_name":…,"wiped_at":<unix_secs>}` · expired: `{"error":{"code":"handle_expired",...}}` · rotated: `{"error":{"code":"handle_invalidated",...}}` (secret rotated after resolve — ADR-004) · tampered ciphertext: `{"error":{"code":"decrypt_failed",...}}` (AES-256-GCM tag check — ADR-005) |
 | *(peer-uid denied)* | any request from a peer whose uid ≠ the server's | `{"error":{"code":"peer_uid_denied",...}}` — no op dispatched |
 | *(other / malformed)* | any unparseable / unknown op | `{"error":{"code","message","retryable":false}}` (`bad_request` / `unknown_op`) |
 
@@ -91,25 +91,37 @@ presents `{handle, sandbox_identity}` at spawn, and vault responds.
 
 ```rust
 impl Vault {
-    pub fn new() -> Self                                                            // wired to SystemClock
-    pub fn with_clock(clock: Box<dyn Clock>) -> Self                                // inject a clock (tests / deterministic expiry)
-    pub fn put(&mut self, secret_ref: &str, value: &str, floor: Mode, binding: Binding)
-    pub fn get(&self, secret_ref: &str) -> serde_json::Value                        // { exists, injection_floor, binding } — NOT the value; unknown ref → no_such_secret
-    pub fn list(&self) -> serde_json::Value                                         // { secrets:[{secret_ref, injection_floor},…] } — NOT any value; empty store → []
-    pub fn rotate(&mut self, secret_ref: &str, value: &str) -> serde_json::Value    // replaces value in place, preserves floor+binding, no value echoed; bumps generation (invalidates outstanding handles)
+    pub fn new() -> Self                                                            // SystemClock + AES-256-GCM backend keyed from env (EnvKeyProvider); no key → fail-closed store
+    pub fn with_clock(clock: Box<dyn Clock>) -> Self                                // inject a clock; env-keyed backend
+    pub fn with_ephemeral_key() -> Self                                             // SystemClock + AES-256-GCM with a fresh random in-process key (the `demo` subcommand)
+    pub fn with_clock_and_backend(clock: Box<dyn Clock>, backend: Box<dyn StoreBackend>) -> Self  // inject clock + store backend (the seam tests use a fixed-key / non-AES backend)
+    pub fn put(&mut self, secret_ref: &str, value: &str, floor: Mode, binding: Binding)  // ENCRYPTS the value (fresh nonce); cleartext not retained; encrypt failure → nothing stored (fail-closed)
+    pub fn get(&self, secret_ref: &str) -> serde_json::Value                        // { exists, injection_floor, binding } — NOT the value; never decrypts; unknown ref → no_such_secret
+    pub fn list(&self) -> serde_json::Value                                         // { secrets:[{secret_ref, injection_floor},…] } — NOT any value; never decrypts; empty store → []
+    pub fn rotate(&mut self, secret_ref: &str, value: &str) -> serde_json::Value    // RE-ENCRYPTS (fresh nonce) in place, preserves floor+binding, no value echoed; bumps generation; encrypt failure → encrypt_failed
     pub fn resolve(&mut self, secret_ref: &str, ttl: u64) -> serde_json::Value     // { handle, ttl, injection_mode } — NOT the value; records expires_at = now + ttl
-    pub fn inject(&mut self, handle: &str, sandbox_id: &str, requested: Option<Mode>) -> serde_json::Value  // handle_consumed → handle_expired → handle_invalidated (rotated) → binding → deliver
+    pub fn inject(&mut self, handle: &str, sandbox_id: &str, requested: Option<Mode>) -> serde_json::Value  // handle_consumed → handle_expired → handle_invalidated → binding → DECRYPT (decrypt_failed on bad tag) → deliver
 }
 
 // Injectable clock seam — SystemClock in production, a test clock for deterministic expiry.
 pub trait Clock: Send + Sync { fn now_unix(&self) -> u64; }
 pub struct SystemClock;   // wall time via std::time::SystemTime
+
+// At-rest crypto seams (src/crypto.rs) — see data-model.md for the type shapes.
+pub trait KeyProvider: Send + Sync { fn key(&self) -> Result<[u8; 32], String>; }   // master key, off the ciphertext
+pub struct EnvKeyProvider;  // VAULT_MASTER_KEY / VAULT_MASTER_KEY_FILE (hex/base64 → 32 bytes); missing → error (fail-closed)
+pub trait StoreBackend: Send + Sync {                                               // the store-encryption seam (no AEAD type leaks to callers)
+    fn encrypt(&self, plaintext: &str) -> Result<EncryptedValue, String>;
+    fn decrypt(&self, value: &EncryptedValue) -> Result<String, String>;           // fails closed on a bad tag
+}
+pub struct AesGcmBackend;   // production AES-256-GCM backend, key from a KeyProvider
 ```
 
-- **The seam is the `Vault` core** (`src/vault.rs`). The v0 implementation holds an in-memory store
-  and handle table. A future backend (encrypted local store, OpenBao, HashiCorp Vault, cloud KMS,
-  PKCS#11 HSM) replaces the store internals **behind these method signatures and the `vault://`
-  scheme** — callers (`main.rs`'s IPC dispatch, `demo`) do not change.
+- **The seam is the `Vault` core** (`src/vault.rs`) plus the `StoreBackend` store-encryption seam
+  (`src/crypto.rs`). The store holds AES-256-GCM ciphertext; the cleartext re-materialises only at
+  `inject`. A future backend (OpenBao, HashiCorp Vault, cloud KMS, PKCS#11 HSM) replaces the
+  `StoreBackend` internals **behind these method signatures and the `vault://` scheme** — callers
+  (`main.rs`'s IPC dispatch, `demo`) do not change.
 - **`resolve` never returns the value** — it returns `{handle, ttl, injection_mode}` or a
   `no_such_secret` / `rng_error` error.
 - **`inject` is fail-closed** — an unknown / consumed / wrong-sandbox handle returns a structured

@@ -36,16 +36,17 @@ vault indirectly via the raise-only floor, honored as `max(secret_floor, request
 
 | Name | Technology | Responsibility | Source path | Depends on |
 |------|------------|----------------|-------------|------------|
-| vault binary | Rust (edition 2021) single static binary | Store secrets, mint single-use handles (`resolve`), and broker credential delivery to the injection edge (`inject`); serve over a uid-restricted Unix socket or a one-shot demo | `src/main.rs`, `src/vault.rs`, `src/handle.rs` | `serde`, `serde_json`, `nix` (socket+user, for `SO_PEERCRED`/`geteuid`) |
+| vault binary | Rust (edition 2021) single static binary | Store secrets **encrypted at rest** (AES-256-GCM), mint single-use handles (`resolve`), and broker credential delivery to the injection edge (`inject`); serve over a uid-restricted Unix socket or a one-shot demo | `src/main.rs`, `src/vault.rs`, `src/crypto.rs`, `src/handle.rs` | `serde`, `serde_json`, `nix` (socket+user, for `SO_PEERCRED`/`geteuid`), `aes-gcm` 0.10.3 (AES-256-GCM) |
 
 **Invariants for this table**
 - The single container corresponds to the one binary crate `vault` (the single-binary layout,
   ADR-001 §2).
-- Runtime dependencies are **`serde` + `serde_json` + `nix`** (`nix` pulls `SO_PEERCRED`/`geteuid`
-  for the peer-uid gate, ADR-002, minimal `socket`+`user` features); randomness is `/dev/urandom`
-  (no `rand` crate). Each added crate makes dep-scan / code-scanner blocking gates — `nix`'s tree was
-  cleared on adoption (ADR-002); a crypto crate for encrypted-at-rest is the next such gate
-  (ADR-001 §2 consequences).
+- Runtime dependencies are **`serde` + `serde_json` + `nix` + `aes-gcm`** (`nix` pulls
+  `SO_PEERCRED`/`geteuid` for the peer-uid gate, ADR-002, minimal `socket`+`user` features;
+  `aes-gcm` 0.10.3 supplies the at-rest AEAD, ADR-005, pinned to the stable line — the 0.11 RC was
+  rejected — default features only); randomness/nonces are `/dev/urandom` (no `rand` crate). Each
+  added crate makes dep-scan / code-scanner blocking gates — both `nix`'s tree (ADR-002) and the
+  `aes-gcm` 0.10.3 tree (ADR-005) were dep-scan-cleared on adoption.
 
 ---
 
@@ -54,7 +55,8 @@ vault indirectly via the raise-only floor, honored as `max(secret_floor, request
 | Container | Component | Source path | Responsibility | Depends on |
 |-----------|-----------|-------------|----------------|------------|
 | vault binary | CLI / IPC server | `src/main.rs` | Parse `serve`/`demo` subcommands and `--socket`; bind the `0600` Unix socket (remove stale first); gate every accept with the kernel-verified `SO_PEERCRED` peer-uid check (`peer_uid_allowed`, equality not privilege, fail-closed) before dispatch; frame newline-delimited JSON; dispatch `ping`/`put`/`get`/`list`/`rotate`/`resolve`/`inject` over an `Arc<Mutex<Vault>>`; run the in-process demo | Vault broker |
-| vault binary | Vault broker | `src/vault.rs` | The in-memory store + handle table; `put`/`get`/`list`/`rotate`/`resolve`/`inject`; metadata-only admin verbs (`get`/`list`/`rotate` never return the value); the `Mode` (env/proxy, ranked), `Binding`, and `Clock` (injectable, `SystemClock` default) types; raise-only floor `max(secret_floor, requested)`; single-use + first-use sandbox binding; TTL expiry (`now >= expires_at`, `handle_expired`); rotate invalidates outstanding handles via a per-secret generation counter (`handle_invalidated`, ADR-004); fail-closed errors. The single seam every future backend replaces | Handle generator |
+| vault binary | Vault broker | `src/vault.rs` | The in-memory store (ciphertext) + handle table; `put`/`get`/`list`/`rotate`/`resolve`/`inject`; **encrypt-on-put / decrypt-at-inject** via the `StoreBackend` seam; metadata-only admin verbs (`get`/`list`/`rotate` never return the value); the `Mode` (env/proxy, ranked), `Binding`, and `Clock` (injectable, `SystemClock` default) types; raise-only floor `max(secret_floor, requested)`; single-use + first-use sandbox binding; TTL expiry (`now >= expires_at`, `handle_expired`); rotate invalidates outstanding handles via a per-secret generation counter (`handle_invalidated`, ADR-004); fail-closed errors | At-rest crypto, Handle generator |
+| vault binary | At-rest crypto | `src/crypto.rs` | The `StoreBackend` seam (store-encryption) + the production `AesGcmBackend` (AES-256-GCM); the `KeyProvider` seam + `EnvKeyProvider` (master key from `VAULT_MASTER_KEY`/`…_FILE`, decoded hex/base64 to 32 bytes, off the ciphertext, never logged); `EncryptedValue { ciphertext, nonce }`; fresh 96-bit nonce per `put`/`rotate` from `/dev/urandom`; decrypt fails closed (`decrypt_failed`) — never a silent wrong value (ADR-005). The store seam every future backend (OpenBao/KMS/HSM) replaces | `aes-gcm` |
 | vault binary | Handle generator | `src/handle.rs` | `new_handle()` — 32 random bytes from `/dev/urandom` (OS CSPRNG), hex-encoded; the opaque single-use capability token | — (std only) |
 
 ---

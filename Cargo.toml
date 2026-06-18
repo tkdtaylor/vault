@@ -16,3 +16,8 @@ serde_json = "1"
 # `socket` (getsockopt + PeerCredentials) + `user` (geteuid) — no default features. Pinned per
 # dep-scan clearance (0.31.3).
 nix = { version = "0.31", default-features = false, features = ["socket", "user"] }
+# AES-256-GCM AEAD for the encrypted-at-rest store (ADR-005). Pinned to the mature RustCrypto
+# 0.10.x line (pulls aead 0.5.x) — NOT the 0.11.0-rc release candidate (pulls aead 0.6.1, which
+# fails dep-scan's 48h age gate; an RC AEAD in the crown-jewel secret path is unacceptable).
+# Default features (aes + alloc) only — the 96-bit nonce comes from /dev/urandom, no `rand` crate.
+aes-gcm = "0.10.3"
