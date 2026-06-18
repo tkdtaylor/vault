@@ -59,9 +59,19 @@ An **opt-in, loopback-only, read-only Vault HTTP API surface** (`src/http.rs`, `
 (`inject`/`put`/`get`/`list`/`rotate`) stay on the `SO_PEERCRED` Unix socket, unreachable over
 HTTP. See ADR-006.
 
+The store is **in-memory and encrypted at rest** (ciphertext in RAM); an **opt-in persistent
+on-disk store** (`src/store_file.rs`, `--store-path` / `VAULT_STORE_PATH`) lets secrets survive a
+restart as an atomic `0600` JSON of **ciphertext + metadata only** — the master key is **never
+written to disk** and **handles never persist** (a restart invalidates every outstanding handle).
+Key/plaintext buffers vault controls are best-effort **zeroized** on drop (`src/zeroize.rs`,
+hand-rolled — the `zeroize` crate is dep-scan-blocked on a maintainer changeover; the cipher's
+internal key copy is a documented residual). See ADR-008 / ADR-009.
+
 The full as-built record is [ADR-001](docs/architecture/decisions/001-foundational-stack.md); the
 v1 increment is recorded in ADR-002 (peer-uid), ADR-003 (TTL clock), ADR-004 (admin verbs),
-ADR-005 (encrypted-at-rest store), and ADR-006 (Vault HTTP API read surface).
+ADR-005 (encrypted-at-rest store), ADR-006 (Vault HTTP API read surface), ADR-007 (cloud
+secret-manager backend — planned), ADR-008 (persistent encrypted disk store), and ADR-009
+(secure-memory zeroization).
 
 ## Project structure
 
@@ -70,6 +80,8 @@ src/
   main.rs    ← entrypoint: serve / demo dispatch; IPC server (ping/put/get/list/rotate/resolve/inject) + SO_PEERCRED gate; opt-in --http-addr
   vault.rs   ← Vault core: store + resolve/inject broker, admin verbs, injectable Clock, StoreBackend/KeyProvider seams, inline tests
   crypto.rs  ← AES-256-GCM StoreBackend + KeyProvider seam (encrypt-on-put / decrypt-at-inject), /dev/urandom nonces
+  store_file.rs ← opt-in persistent encrypted store: atomic 0600 JSON of ciphertext+metadata (key off disk, handles never persist)
+  zeroize.rs ← hand-rolled best-effort memory wipe (write_volatile + compiler_fence) for key/plaintext buffers — no zeroize crate
   http.rs    ← loopback-only, read-only Vault HTTP API read surface (resolve → handle envelope; never the value)
   handle.rs  ← capability-handle generation (32 random bytes from /dev/urandom, hex-encoded)
 Cargo.toml   ← crate manifest (serde + serde_json + nix + aes-gcm + tiny_http)
