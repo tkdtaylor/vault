@@ -83,12 +83,27 @@ rule F-006.
 
 When `--store-path PATH` is set, the persistent store file is written **`0600`** (owner-only) — the
 on-disk analogue of the `0600` socket: the filesystem ACL stops other uids from reading the
-ciphertext. The write is **atomic and crash-safe**: a temp file `<PATH>.tmp.<pid>` in the same
-directory is `chmod 0600` **before** any ciphertext is written, then `write_all` + `fsync`, then an
-atomic `rename` over `PATH`. A crash mid-write leaves either the old complete file or the temp file
+ciphertext. The write is **atomic, crash-safe, and safe-by-construction**: a temp file
+`<PATH>.tmp.<hex>` in the same directory is created with `O_CREAT | O_EXCL | O_NOFOLLOW` and mode
+`0o600` set **at creation** (not chmod-after-open — there is no umask-mode window), where `<hex>` is
+fresh random bytes from `/dev/urandom` so the temp path is unpredictable across restarts. A
+pre-existing temp path — a planted symlink or a stale temp — is an **error** (`O_EXCL`), never
+silently reused, and the open refuses to follow a symlink (`O_NOFOLLOW`), closing the symlink/TOCTOU
+arbitrary-overwrite vector (SEC-001). Then `write_all` + `fsync`, an atomic `rename` over `PATH`,
+and finally an **`fsync` of the parent directory** so the rename's directory-entry update itself
+survives a crash (SEC-002). A crash mid-write leaves either the old complete file or the temp file
 — never a half-written store. A failed write surfaces `store_persist_failed` and rolls back the
 in-memory mutation (ADR-008 §4). The file holds **ciphertext + nonce + non-secret metadata only** —
 the master key and the cleartext are never written, and **handles never persist** (ADR-008 §5/§6).
+
+**Operator invariant — store-directory posture (SEC-003).** The `--store-path` **parent
+directory** MUST be owned by the vault uid and **not group- or world-writable**. The `0600` file
+protects the store's *contents*, but a writable directory is the surface for temp-path games
+(planting a symlink at the temp name, racing the rename). FIX 1's `O_EXCL`/`O_NOFOLLOW`/random
+suffix already closes the active vector; the directory restriction is defense-in-depth and is the
+operator's responsibility. At `serve` startup with a store path set, vault emits a **non-fatal
+stderr WARNING** if the parent directory is group/world-writable (it does **not** refuse to start,
+and never logs any secret — only the directory path and its mode).
 
 ---
 

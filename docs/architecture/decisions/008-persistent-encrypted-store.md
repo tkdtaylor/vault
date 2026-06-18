@@ -139,12 +139,18 @@ negligible. If the store ever grows large enough to matter, an append-log is a l
 behind the same `StoreFile` interface.)
 
 **Atomic + crash-safe write (mandatory).** Persist writes a **temp file in the same directory**
-(`<path>.tmp.<pid>`), `chmod 0600` on it **before** writing any ciphertext, `write_all` + **`fsync`**
-the temp file, then **atomically `rename`** it over the real path. A crash mid-write leaves either
-the old complete file or the temp file — **never a half-written store**. The `0600` mode matches the
-socket (ADR-002): the file holds ciphertext + metadata; same-uid-only by filesystem ACL, the
-on-disk analogue of the uid-restricted socket. (`rename` within a directory is atomic on POSIX; same
-directory guarantees same filesystem so the rename can't degrade to copy.)
+(`<path>.tmp.<hex>`, where `<hex>` is fresh `/dev/urandom` bytes). The temp file is created
+**safe-by-construction** (SEC-001 hardening, as-built): `O_CREAT | O_EXCL | O_NOFOLLOW` with mode
+`0o600` set **at creation** — not `chmod`-after-open, which left a brief umask-mode
+world/group-readable window and a predictable, follow-able temp path. `O_EXCL` makes a pre-existing
+temp path an error (never silently reused); `O_NOFOLLOW` refuses to open through a planted symlink;
+the random suffix defeats predictability across restarts. Then `write_all` + **`fsync`** the temp
+file, **atomically `rename`** it over the real path, and finally **`fsync` the parent directory** so
+the rename's directory-entry update is itself durable across a crash (SEC-002). A crash mid-write
+leaves either the old complete file or the temp file — **never a half-written store**. The `0600`
+mode matches the socket (ADR-002): the file holds ciphertext + metadata; same-uid-only by filesystem
+ACL, the on-disk analogue of the uid-restricted socket. (`rename` within a directory is atomic on
+POSIX; same directory guarantees same filesystem so the rename can't degrade to copy.)
 
 **Fail-closed on a persist failure.** If the atomic write fails (disk full, permission, fsync error),
 the op surfaces a structured error (`store_persist_failed`) — the in-memory mutation is **not** the
@@ -257,6 +263,14 @@ Persistence is **opt-in and off by default**:
   are now load-bearing. A misconfigured umask or a backup tool that widens permissions is a new way
   to expose ciphertext (still useless without the key, but defense-in-depth degrades). The spec must
   state the `0600` + same-directory-rename requirements as invariants.
+  - **Store-directory posture is an operator invariant (SEC-003).** The `--store-path` parent
+    directory MUST be owned by the vault uid and **not** group/world-writable. The `0600` file
+    protects contents; a writable directory is the surface for temp-path games (planting a symlink
+    at the temp name, racing the rename). The as-built temp-file hardening (SEC-001 —
+    `O_EXCL`/`O_NOFOLLOW`/random suffix, mode-at-create) closes the active vector; the directory
+    restriction is defense-in-depth and is documented in `configuration.md`. `serve` emits a
+    **non-fatal** startup WARNING (never refuses to start, never logs a secret) when the parent
+    directory is group/world-writable.
 - **Synchronous write-through adds an `fsync` to every `put`/`rotate`** — fine at vault's scale,
   but it makes those ops disk-bound and introduces `store_persist_failed` as a new failure mode.
 - **Whole-file rewrite per mutation is O(n)** — a non-issue for tens of secrets; an append-log is a

@@ -13,12 +13,15 @@
 //!     records here), reinforced by this module never having a handle type.
 //!   - **No decrypt at load** — load base64-decodes into `EncryptedValue`s; decryption stays at the
 //!     `inject` edge (REQ-001, §7). A wrong key surfaces later as `decrypt_failed`, not at load.
-//!   - **Atomic + `0600` write** — temp file in the same dir, `chmod 0600` BEFORE any bytes, fsync,
-//!     atomic rename (REQ-005/REQ-006, §4).
+//!   - **Atomic + `0600` write** — a temp file in the same dir, created `0600` **at creation**
+//!     (`O_CREAT|O_EXCL|O_NOFOLLOW`, mode `0o600`) with a random suffix so it is unpredictable, not
+//!     reusable, and never follows a symlink; then `write_all`, `fsync`, atomic `rename`, and a
+//!     `fsync` of the parent directory for durability (REQ-005/REQ-006, §4; SEC-001/SEC-002).
 //!   - **Refuse to start on a corrupt file** — bad JSON / unknown version / bad base64 / wrong-length
 //!     nonce → a structured [`LoadError`]; the caller refuses to start, never panics (REQ-004, §8).
 
-use std::io::Write;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -155,13 +158,20 @@ pub fn load(path: &Path) -> Result<Vec<LoadedRecord>, LoadError> {
     Ok(out)
 }
 
-/// Persist the whole store to `path`, atomically and `0600` (ADR-008 §4).
+/// Persist the whole store to `path`, atomically and `0600` (ADR-008 §4; SEC-001/SEC-002).
 ///
-/// Write path: a temp file `<path>.tmp.<pid>` **in the same directory** → `chmod 0600` BEFORE any
-/// ciphertext bytes are written → `write_all` → `fsync` → atomic `rename` over `path`. A crash
-/// mid-write leaves either the old complete file or the temp file — never a half-written store. Any
-/// I/O failure returns `Err` so the caller surfaces `store_persist_failed` — never a silent success
-/// (REQ-006). On error the temp file is best-effort removed and the prior `path` is left intact.
+/// Write path: a temp file `<path>.tmp.<hex>` **in the same directory**, created **safe by
+/// construction** — `O_CREAT | O_EXCL | O_NOFOLLOW` with mode `0o600` set **at creation** (not
+/// chmod-after-open, which leaves a brief umask-mode window). The `<hex>` suffix is fresh random
+/// bytes from `/dev/urandom`, so the temp path is unpredictable across restarts and a pre-existing
+/// path (an attacker's planted symlink or stale temp) is an **error** (O_EXCL), never silently
+/// reused, and the open refuses to follow a symlink (O_NOFOLLOW) — closing the TOCTOU /
+/// arbitrary-overwrite vector (SEC-001). Then `write_all` → `fsync` (the file is durable) → atomic
+/// `rename` over `path` → `fsync` of the **parent directory** so the directory-entry update itself
+/// survives a crash just after the rename (SEC-002). A crash mid-write leaves either the old
+/// complete file or the temp file — never a half-written store. Any I/O failure returns `Err` so
+/// the caller surfaces `store_persist_failed` — never a silent success (REQ-006). On error the temp
+/// file is best-effort removed and the prior `path` is left intact.
 pub fn persist(path: &Path, records: &[RecordView<'_>]) -> Result<(), String> {
     let doc = StoreFileDoc {
         version: FORMAT_VERSION,
@@ -184,17 +194,16 @@ pub fn persist(path: &Path, records: &[RecordView<'_>]) -> Result<(), String> {
     let json =
         serde_json::to_vec_pretty(&doc).map_err(|e| format!("store serialization failed: {e}"))?;
 
-    let tmp = temp_path(path);
+    // Random, unpredictable temp suffix from /dev/urandom (SEC-001) — not the PID, which is
+    // predictable across restarts. A creation failure here fails the whole persist closed.
+    let tmp = temp_path(path).map_err(|e| format!("store_persist temp-name failed: {e}"))?;
+
     // Scope the file handle so it is closed before the rename.
     let write_result = (|| -> std::io::Result<()> {
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
-        // chmod 0600 BEFORE writing any ciphertext (ADR-008 §4) — Unix only.
-        set_0600(&f)?;
-        let mut f = f;
+        // Safe by construction (SEC-001): mode 0o600 set AT creation, O_EXCL so a pre-existing
+        // temp path is an error (never silently reused), O_NOFOLLOW so the open refuses to follow
+        // a symlink planted at the temp path. No chmod-after-open window.
+        let mut f = open_temp_0600_excl_nofollow(&tmp)?;
         f.write_all(&json)?;
         f.sync_all()?; // fsync — durable before the rename
         Ok(())
@@ -210,25 +219,58 @@ pub fn persist(path: &Path, records: &[RecordView<'_>]) -> Result<(), String> {
         let _ = std::fs::remove_file(&tmp);
         format!("store_persist rename failed: {e}")
     })?;
+
+    // fsync the PARENT DIRECTORY so the rename's directory-entry update is itself durable — a
+    // crash immediately after the rename would otherwise lose it (SEC-002, ADR-008 §4). On Linux,
+    // opening a directory read-only and calling sync_all is valid. Best-effort directory resolution
+    // ("." for a bare filename) keeps this total over any same-dir path.
+    sync_parent_dir(path).map_err(|e| format!("store_persist dir fsync failed: {e}"))?;
     Ok(())
 }
 
-/// `<path>.tmp.<pid>` in the SAME directory as `path` (ADR-008 §4 — same-fs atomic rename).
-fn temp_path(path: &Path) -> PathBuf {
-    let mut s = path.as_os_str().to_os_string();
-    s.push(format!(".tmp.{}", std::process::id()));
-    PathBuf::from(s)
-}
-
+/// Open the temp file safe-by-construction for the persist path (SEC-001): create it with
+/// `O_CREAT | O_EXCL | O_NOFOLLOW` and mode `0o600` set **at creation**. Returns an error (which
+/// the caller maps to `store_persist_failed`) if the path already exists or is a symlink.
 #[cfg(unix)]
-fn set_0600(f: &std::fs::File) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+fn open_temp_0600_excl_nofollow(tmp: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true) // O_CREAT | O_EXCL — pre-existing path is an error, never reused
+        .mode(0o600) // mode AT creation — no umask-mode window, no chmod-after-open
+        .custom_flags(nix::libc::O_NOFOLLOW) // refuse to follow a symlink at the temp path
+        .open(tmp)
 }
 
 #[cfg(not(unix))]
-fn set_0600(_f: &std::fs::File) -> std::io::Result<()> {
-    Ok(())
+fn open_temp_0600_excl_nofollow(tmp: &Path) -> std::io::Result<File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)
+}
+
+/// fsync the parent directory of `path` so a rename into it is durable (SEC-002). A bare filename
+/// (no parent component) resolves to `"."` — the current directory, which is the same directory the
+/// same-dir temp/rename live in.
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    File::open(parent)?.sync_all()
+}
+
+/// `<path>.tmp.<hex>` in the SAME directory as `path`, where `<hex>` is fresh random bytes from
+/// `/dev/urandom` (ADR-008 §4 — same-fs atomic rename; SEC-001 — unpredictable, non-reusable temp
+/// name). The same RNG source as `handle.rs` / `crypto.rs` (no `rand` crate, project rule D4).
+fn temp_path(path: &Path) -> std::io::Result<PathBuf> {
+    let mut suffix = [0u8; 8];
+    File::open("/dev/urandom")?.read_exact(&mut suffix)?;
+    let hex: String = suffix.iter().map(|b| format!("{:02x}", b)).collect();
+    let mut s = path.as_os_str().to_os_string();
+    s.push(format!(".tmp.{hex}"));
+    Ok(PathBuf::from(s))
 }
 
 #[cfg(test)]
@@ -378,7 +420,9 @@ mod tests {
         assert!(persist(path, &views).is_err(), "unwritable dir must error");
     }
 
-    /// REQ-006: after a successful persist, only the real path exists — the temp file is gone.
+    /// REQ-006: after a successful persist, only the real path exists — no `<path>.tmp.*` temp
+    /// file lingers in the directory (the random suffix means we scan the dir rather than rebuild
+    /// the exact name).
     #[test]
     fn persist_leaves_no_temp_file() {
         let dir = temp_dir();
@@ -394,7 +438,71 @@ mod tests {
         }];
         persist(&path, &views).expect("persist ok");
         assert!(path.exists(), "real path exists");
-        assert!(!temp_path(&path).exists(), "temp file removed after rename");
+        let leftover_temp = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("store.json.tmp.")
+            });
+        assert!(!leftover_temp, "no .tmp.* temp file remains after rename");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// SEC-001: the temp file is created mode `0o600` AT CREATION (not chmod-after-open), proven by
+    /// holding the file open across the write window and checking its mode while it still exists.
+    /// We exercise the exact open path `persist` uses (`open_temp_0600_excl_nofollow`).
+    #[cfg(unix)]
+    #[test]
+    fn temp_file_is_created_0600_at_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        let tmp = temp_path(&dir.join("store.json")).expect("temp name");
+        let f = open_temp_0600_excl_nofollow(&tmp).expect("temp open ok");
+        // Mode is 0600 immediately on creation — no umask-widened window before any write.
+        let mode = f.metadata().unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "temp file must be 0600 at creation, not after a later chmod"
+        );
+        drop(f);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// SEC-001: a pre-existing temp path is an ERROR (O_EXCL), never silently reused.
+    #[cfg(unix)]
+    #[test]
+    fn temp_open_refuses_preexisting_path() {
+        let dir = temp_dir();
+        let tmp = temp_path(&dir.join("store.json")).expect("temp name");
+        // Plant a regular file at the temp path first.
+        std::fs::write(&tmp, b"squatter").unwrap();
+        let r = open_temp_0600_excl_nofollow(&tmp);
+        assert!(r.is_err(), "O_EXCL must reject a pre-existing temp path");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// SEC-001: a symlink planted at the temp path is NOT followed (O_NOFOLLOW) — the open errors
+    /// rather than writing through the link to an attacker-chosen target.
+    #[cfg(unix)]
+    #[test]
+    fn temp_open_refuses_to_follow_symlink() {
+        let dir = temp_dir();
+        let target = dir.join("attacker-target");
+        let tmp = temp_path(&dir.join("store.json")).expect("temp name");
+        // Plant a symlink at the temp path pointing at a target the attacker wants overwritten.
+        std::os::unix::fs::symlink(&target, &tmp).expect("create symlink");
+        let r = open_temp_0600_excl_nofollow(&tmp);
+        assert!(
+            r.is_err(),
+            "O_NOFOLLOW must refuse to open through a symlink"
+        );
+        assert!(
+            !target.exists(),
+            "the symlink target must NOT have been created/overwritten"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

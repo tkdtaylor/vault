@@ -288,20 +288,25 @@ points* ([interfaces.md](interfaces.md)).
 - **Trigger:** a successful `put` or `rotate` when `--store-path PATH` is set. (`resolve`/`inject`/
   `get`/`list` never trigger it.)
 - **Response:** after the in-memory mutation succeeds, the **whole encrypted store** is serialized to
-  `PATH` and written **atomically and `0600`**: a temp file `<PATH>.tmp.<pid>` in the same directory
-  is `chmod 0600` **before** any ciphertext is written, then `write_all` + `fsync`, then an atomic
-  `rename` over `PATH`. The file holds the `StoredRecord` DTO per ref — base64 `ciphertext` + `nonce`
-  + cleartext `injection_floor`/`binding`/`generation` — **never the key, never the cleartext, never
-  any handle** (ADR-008 §2/§5/§6).
+  `PATH` and written **atomically, `0600`, and safe-by-construction**: a temp file `<PATH>.tmp.<hex>`
+  (random `/dev/urandom` suffix) in the same directory is created with `O_CREAT | O_EXCL |
+  O_NOFOLLOW` and mode `0o600` set **at creation** (no chmod-after-open window, no predictable or
+  follow-able temp path — SEC-001), then `write_all` + `fsync`, then an atomic `rename` over `PATH`,
+  then an **`fsync` of the parent directory** so the rename is durable (SEC-002). The file holds the
+  `StoredRecord` DTO per ref — base64 `ciphertext` + `nonce` + cleartext
+  `injection_floor`/`binding`/`generation` — **never the key, never the cleartext, never any handle**
+  (ADR-008 §2/§5/§6).
 - **Side effects:** replaces the store file on disk; the prior file is left intact until the atomic
   rename. A crash mid-write leaves either the old complete file or the temp file — never a
-  half-written store.
-- **Failure modes:** a failed write (disk full, permission, fsync error) → the in-memory mutation is
-  **rolled back** to its prior state and the op returns `{error:{code:"store_persist_failed",…}}` —
-  never a silent success that diverges from disk. The temp file is best-effort removed and `PATH` is
-  left intact. *(Tests: `tc006_store_file_is_0600`,
+  half-written store. A pre-existing temp path (planted symlink or stale temp) makes the write fail
+  closed (`O_EXCL`/`O_NOFOLLOW`) rather than overwriting an attacker-chosen target (SEC-001).
+- **Failure modes:** a failed write (disk full, permission, fsync error, a squatted/symlinked temp
+  path) → the in-memory mutation is **rolled back** to its prior state and the op returns
+  `{error:{code:"store_persist_failed",…}}` — never a silent success that diverges from disk. The
+  temp file is best-effort removed and `PATH` is left intact. *(Tests: `tc006_store_file_is_0600`,
   `tc007_failed_persist_is_store_persist_failed_and_atomic`,
-  `tc008_write_through_on_put_and_rotate_only`; ADR-008 §4.)*
+  `tc008_write_through_on_put_and_rotate_only`, `temp_file_is_created_0600_at_creation`,
+  `temp_open_refuses_preexisting_path`, `temp_open_refuses_to_follow_symlink`; ADR-008 §4.)*
 
 ### B-020: Load the encrypted store on startup; refuse to start on corruption; handles never persist
 
