@@ -53,17 +53,26 @@ All four admin verbs (`put`/`get`/`list`/`rotate`) are wired in the IPC dispatch
 secret value — and `rotate` invalidates outstanding handles for the rotated ref via a
 per-secret generation counter (`handle_invalidated`). See ADR-004.
 
-The full as-built record is [ADR-001](docs/architecture/decisions/001-foundational-stack.md);
-the v1 increment is recorded in ADR-002 (peer-uid), ADR-003 (TTL clock), and ADR-004 (admin verbs).
+An **opt-in, loopback-only, read-only Vault HTTP API surface** (`src/http.rs`, `--http-addr
+127.0.0.1:PORT`) exposes `GET /v1/sys/health` and `GET /v1/secret/data/:path` → `resolve` → a
+**handle** in the Vault KV-v2 envelope — **never the value**. Value delivery and every mutation
+(`inject`/`put`/`get`/`list`/`rotate`) stay on the `SO_PEERCRED` Unix socket, unreachable over
+HTTP. See ADR-006.
+
+The full as-built record is [ADR-001](docs/architecture/decisions/001-foundational-stack.md); the
+v1 increment is recorded in ADR-002 (peer-uid), ADR-003 (TTL clock), ADR-004 (admin verbs),
+ADR-005 (encrypted-at-rest store), and ADR-006 (Vault HTTP API read surface).
 
 ## Project structure
 
 ```
 src/
-  main.rs    ← entrypoint: serve / demo dispatch; IPC server (ping/put/get/list/rotate/resolve/inject) + SO_PEERCRED gate
-  vault.rs   ← Vault core: store + resolve/inject broker, admin verbs, injectable Clock, Mode/Binding, inline tests
+  main.rs    ← entrypoint: serve / demo dispatch; IPC server (ping/put/get/list/rotate/resolve/inject) + SO_PEERCRED gate; opt-in --http-addr
+  vault.rs   ← Vault core: store + resolve/inject broker, admin verbs, injectable Clock, StoreBackend/KeyProvider seams, inline tests
+  crypto.rs  ← AES-256-GCM StoreBackend + KeyProvider seam (encrypt-on-put / decrypt-at-inject), /dev/urandom nonces
+  http.rs    ← loopback-only, read-only Vault HTTP API read surface (resolve → handle envelope; never the value)
   handle.rs  ← capability-handle generation (32 random bytes from /dev/urandom, hex-encoded)
-Cargo.toml   ← crate manifest (serde + serde_json + nix)
+Cargo.toml   ← crate manifest (serde + serde_json + nix + aes-gcm + tiny_http)
 docs/        ← spec + planning + history (the source-of-truth side)
   spec/           authoritative current-state snapshot — SPEC.md, behaviors, architecture, data-model, interfaces, configuration, fitness-functions
   architecture/   overview, diagrams.md, ADRs (decisions/)
@@ -86,9 +95,11 @@ the same change.
 ## Tech stack
 
 Rust (edition 2021). Single static binary. Minimal dependency floor: `serde` + `serde_json`
-(JSON over the socket) and `nix` (kernel `SO_PEERCRED` peer-uid check, task 001). Each addition
-clears dep-scan and is recorded in an ADR. Randomness comes from the OS CSPRNG via `/dev/urandom`
-— **no `rand` crate**. License: **PolyForm Noncommercial 1.0.0**.
+(JSON over the socket), `nix` (kernel `SO_PEERCRED` peer-uid check, task 001), `aes-gcm` 0.10.3
+(encrypted-at-rest store, task 004), and `tiny_http` 0.12 (the loopback HTTP read surface, task
+005). Each addition clears dep-scan and is recorded in an ADR. Randomness — handles **and**
+AES-GCM nonces — comes from the OS CSPRNG via `/dev/urandom` — **no `rand` crate**. License:
+**PolyForm Noncommercial 1.0.0**.
 
 ## Commands
 
