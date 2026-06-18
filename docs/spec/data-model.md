@@ -37,18 +37,19 @@ store is in-memory and lost on restart.
 ### State: `Vault.handles` — the handle table
 
 - **Shape:** `HashMap<String, HandleRec>` keyed by the hex handle string.
-  `HandleRec { secret_ref: String, mode: Mode (the secret's floor at resolve time), ttl: u64,
-  consumed: bool, bound_sandbox: Option<String> }` (`src/vault.rs`).
-- **Owner:** the `Vault` value; same `Arc<Mutex<Vault>>`.
+  `HandleRec { secret_ref: String, mode: Mode (the secret's floor at resolve time), expires_at: u64,
+  consumed: bool, bound_sandbox: Option<String> }` (`src/vault.rs`). `expires_at` is the absolute
+  Unix-seconds expiry, computed at `resolve` as `clock.now_unix() + ttl` (saturating add).
+- **Owner:** the `Vault` value; same `Arc<Mutex<Vault>>`. `Vault` also holds a `Box<dyn Clock>` —
+  `SystemClock` in production (`Vault::new`), an injectable test clock via `Vault::with_clock`.
 - **Lifetime:** process lifetime; a record is inserted by `resolve` and mutated (consumed + bound)
-  by `inject`. Records are not removed (no GC / TTL clock in v0).
+  by `inject`. Records are not removed (no reaper) — an expired record stays in the table but is
+  un-injectable (`handle_expired`).
 - **Concurrency rules:** guarded by the same `Mutex`.
 - **Invariant:** a record is **single-use** — `consumed` flips to `true` on the first successful
-  `inject` and is never reset; `bound_sandbox` is set on first inject and never re-bound.
-
-> TODO: `HandleRec.ttl` is **stored but not enforced** — there is no auto-wipe clock
-> (`#[allow(dead_code)] ttl` in `src/vault.rs`). The `wiped_at` field of the env-mode response is a
-> placeholder `0`. TTL enforcement is a v0 limitation.
+  `inject` and is never reset; `bound_sandbox` is set on first inject and never re-bound. A record
+  is **expired** once `clock.now_unix() >= expires_at` (exactly-at-expiry is expired; `ttl=0` ⇒
+  immediate). On `inject`, the consumed check precedes the expiry check.
 
 ---
 
@@ -125,11 +126,14 @@ defaults to `300` if absent. `injection_mode` is the secret's stored floor.
 → env delivery:
 
 ```json
-{ "ok":true, "delivery":"env", "credential":"SK-…", "var_name":"API_KEY", "wiped_at":0 }
+{ "ok":true, "delivery":"env", "credential":"SK-…", "var_name":"API_KEY", "wiped_at":1718600000 }
 ```
 
-The effective mode is `max(secret_floor, mode)`. `wiped_at` is a placeholder `0` (the TTL clock is
-not yet enforced). The `credential` crosses only the uid-restricted socket to the injection edge.
+The effective mode is `max(secret_floor, mode)`. `wiped_at` (env mode only) is the inject-time clock
+value in Unix seconds — the moment the credential is handed to the env-setter; proxy deliveries carry
+no `wiped_at`. An inject after the handle's TTL has elapsed (`now >= expires_at`) returns
+`{error:{code:"handle_expired",…}}` with **no** credential. The `credential` crosses only the
+uid-restricted socket to the injection edge.
 
 ### Format: `ping` request
 
@@ -152,7 +156,8 @@ All current errors are `retryable:false`. Codes:
 | `unknown_op` | `false` | an unsupported IPC op |
 | `no_such_secret` | `false` | `resolve` of a `secret_ref` not in the store |
 | `unknown_handle` | `false` | `inject` of a handle not in the handle table |
-| `handle_consumed` | `false` | `inject` of an already-used handle (replay) |
+| `handle_consumed` | `false` | `inject` of an already-used handle (replay); checked before expiry |
+| `handle_expired` | `false` | `inject` of an unconsumed handle past its TTL (`now >= expires_at`) |
 | `handle_bound_to_other_sandbox` | `false` | `inject` from a sandbox other than the bound one |
 | `rng_error` | `false` | `/dev/urandom` read failure while minting a handle |
 
@@ -167,5 +172,8 @@ All current errors are `retryable:false`. Codes:
   `env < proxy`; a weaker requested mode never lowers a stronger stored floor.
 - **A handle is consumed once and bound to one sandbox.** `consumed` never resets; `bound_sandbox`
   never re-binds.
+- **A handle has an absolute expiry.** `expires_at = resolve_time + ttl`; once `now >= expires_at`
+  an unconsumed handle is un-injectable (`handle_expired`). The consumed check precedes the expiry
+  check, so a consumed+expired handle reports `handle_consumed`.
 - **No engine/backend-specific type crosses the wire** — the contract is plain `vault://`-shaped
   JSON, so a future store backend (encrypted / OpenBao / KMS / HSM) slots in behind it unchanged.
