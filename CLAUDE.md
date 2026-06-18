@@ -27,8 +27,9 @@ These are load-bearing — violating one breaks the security model, not just sty
   path is memory-safe by construction (no buffer overruns leaking adjacent memory). *(Enforced by
   the language.)*
 - **Plaintext crosses only the uid-restricted socket.** The vault→proxy handoff (D5) travels a
-  `0600` Unix socket. A SO_PEERCRED peer-uid check is **not yet** wired — a known gap, tracked in
-  fitness rule F-006. *(Partially enforced in `src/main.rs::serve`.)*
+  `0600` Unix socket **plus** a kernel-level `SO_PEERCRED` peer-uid assertion: each accepted
+  connection's uid must equal the server's effective uid or it is rejected fail-closed
+  (`peer_uid_denied`) before any op dispatches. *(Enforced in `src/main.rs::handle_conn`; task 001.)*
 
 ## Contract (v1 — don't break without a contracts bump)
 
@@ -36,7 +37,7 @@ These are load-bearing — violating one breaks the security model, not just sty
 resolve(secret_ref, requester_identity) -> { handle, ttl, injection_mode }       # NOT the value
 inject(handle, sandbox_identity, mode)  -> proxy: { ok, delivery, credential, binding{host,header,scheme} }
                                            env:   { ok, delivery, credential, var_name, wiped_at }
-put | get | list | rotate (admin)        # only `put` is wired in the IPC dispatch today
+put | get | list | rotate (admin)        # all four wired in the IPC dispatch (get/list/rotate are metadata-only)
 ```
 
 - **Fail-closed:** effective mode = `max(secret_floor, requested)`. vault may RAISE the injection
@@ -47,20 +48,22 @@ put | get | list | rotate (admin)        # only `put` is wired in the IPC dispat
   surfaced (A7): exec-sandbox's proxy needs them to actually inject. They cross only the
   uid-restricted vault socket — the injection edge.
 
-> TODO: `get`/`list`/`rotate` are v1 contract verbs but only `put` is implemented in the IPC
-> dispatch (`src/main.rs::dispatch`). The other admin verbs are not yet wired — flagged honestly
-> as a gap in the spec.
+All four admin verbs (`put`/`get`/`list`/`rotate`) are wired in the IPC dispatch
+(`src/main.rs::dispatch`). `get`/`list`/`rotate` are **metadata-only** — they never echo the
+secret value — and `rotate` invalidates outstanding handles for the rotated ref via a
+per-secret generation counter (`handle_invalidated`). See ADR-004.
 
-The full as-built record is [ADR-001](docs/architecture/decisions/001-foundational-stack.md).
+The full as-built record is [ADR-001](docs/architecture/decisions/001-foundational-stack.md);
+the v1 increment is recorded in ADR-002 (peer-uid), ADR-003 (TTL clock), and ADR-004 (admin verbs).
 
 ## Project structure
 
 ```
 src/
-  main.rs    ← entrypoint: serve / demo subcommand dispatch; IPC server (ping/put/resolve/inject)
-  vault.rs   ← Vault core: store + resolve/inject broker, Mode/Binding, inline #[cfg(test)] tests
+  main.rs    ← entrypoint: serve / demo dispatch; IPC server (ping/put/get/list/rotate/resolve/inject) + SO_PEERCRED gate
+  vault.rs   ← Vault core: store + resolve/inject broker, admin verbs, injectable Clock, Mode/Binding, inline tests
   handle.rs  ← capability-handle generation (32 random bytes from /dev/urandom, hex-encoded)
-Cargo.toml   ← crate manifest (serde + serde_json only)
+Cargo.toml   ← crate manifest (serde + serde_json + nix)
 docs/        ← spec + planning + history (the source-of-truth side)
   spec/           authoritative current-state snapshot — SPEC.md, behaviors, architecture, data-model, interfaces, configuration, fitness-functions
   architecture/   overview, diagrams.md, ADRs (decisions/)
@@ -82,9 +85,10 @@ the same change.
 
 ## Tech stack
 
-Rust (edition 2021). Single static binary. Two runtime dependencies only: `serde` + `serde_json`
-(JSON over the socket). Randomness comes from the OS CSPRNG via `/dev/urandom` — **no `rand`
-crate**. License: **PolyForm Noncommercial 1.0.0**.
+Rust (edition 2021). Single static binary. Minimal dependency floor: `serde` + `serde_json`
+(JSON over the socket) and `nix` (kernel `SO_PEERCRED` peer-uid check, task 001). Each addition
+clears dep-scan and is recorded in an ADR. Randomness comes from the OS CSPRNG via `/dev/urandom`
+— **no `rand` crate**. License: **PolyForm Noncommercial 1.0.0**.
 
 ## Commands
 
