@@ -69,6 +69,15 @@ value-free `resolve` — returning the **handle** in a Vault-shaped envelope, ne
   `src/main.rs`. Proposed fitness rule F-004.)*
 - **Memory-safe language for the secret path.** vault is Rust. *(Enforced by the language. Proposed
   fitness rule F-005.)*
+- **Best-effort zeroization of key/plaintext buffers vault controls.** The 32-byte master key (raw
+  `String`, decoded buffer, in-`new` copy, the ephemeral `random_key()` buffer) and the decrypted
+  plaintext `Vec<u8>` are overwritten with zeros on drop via a hand-rolled `Zeroizing<T>` wrapper
+  (`core::ptr::write_volatile` per byte + a `SeqCst` `compiler_fence`, std-only — no `zeroize`
+  crate; SEC-001, ADR-009). This is **defense-in-depth, not a guarantee** — Rust may move a value
+  before drop. **Documented residual:** the key copy held *inside* the `aes_gcm::Aes256Gcm` cipher
+  object is **not** wiped (that needs aes-gcm's `zeroize` feature → the dep-scan-BLOCKED `zeroize`
+  crate). *(Enforced in `src/zeroize.rs` + the key/plaintext call sites in `src/crypto.rs` /
+  `src/vault.rs`; test `wrapper_zeros_backing_bytes_on_drop`; ADR-009.)*
 - **Encrypted at rest, key off the ciphertext.** Each stored value is AES-256-GCM ciphertext with a
   unique 96-bit nonce per `put`/`rotate`; the cleartext is held nowhere at rest and re-materialises
   only at `inject` (the edge). The 32-byte key comes from a key-provider seam and is never serialized
