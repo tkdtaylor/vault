@@ -1,6 +1,6 @@
 # Architecture Diagrams — vault
 
-**Last updated:** 2026-06-18 (task 005 — opt-in loopback HTTP read surface beside the Unix socket, ADR-006)
+**Last updated:** 2026-06-18 (task 007 — opt-in persistent encrypted-on-disk store via the StoreFile layer, ADR-008)
 
 C4-structured Mermaid diagrams plus the primary runtime sequence. See [overview.md](overview.md)
 for prose context, [decisions/](decisions/) for the ADRs referenced here, and
@@ -57,10 +57,11 @@ C4Component
     Person(operator, "Operator")
 
     Container_Boundary(boundary, "vault binary") {
-        Component(main, "CLI / IPC server", "src/main.rs", "serve & demo subcommands; bind 0600 Unix socket; SO_PEERCRED peer-uid gate (peer_uid_allowed) before dispatch; frame newline-delimited JSON; dispatch ping/put/get/list/rotate/resolve/inject; opt-in --http-addr starts the HTTP read surface")
+        Component(main, "CLI / IPC server", "src/main.rs", "serve & demo subcommands; bind 0600 Unix socket; SO_PEERCRED peer-uid gate (peer_uid_allowed) before dispatch; frame newline-delimited JSON; dispatch ping/put/get/list/rotate/resolve/inject; opt-in --http-addr starts the HTTP read surface; opt-in --store-path / VAULT_STORE_PATH loads the persistent encrypted store (refuse-to-start on corrupt file)")
         Component(http, "HTTP read surface", "src/http.rs", "OPT-IN, loopback-only (loopback_only=127.0.0.1, else fail-closed refuse), read-only Vault KV-v2 API shape; GET /v1/sys/health + GET /v1/secret/data/:path -> resolve -> HANDLE in KV-v2 envelope (NEVER the value); fail-closed 405/404/400; NO inject/put/rotate/get/list route; shares the same Arc<Mutex<Vault>>; pure http_route/http_secret_ref/kv2_envelope/http_response_for")
         Component(core, "Vault broker", "src/vault.rs", "store (ciphertext) + handle table; put/get/list/rotate/resolve/inject; encrypt-on-put / decrypt-at-inject; metadata-only admin verbs (never the value); raise-only floor max(secret_floor, requested); single-use + first-use sandbox binding; TTL expiry (now >= expires_at) via injectable Clock; rotate invalidates outstanding handles (per-secret generation); fail-closed errors")
-        Component(crypto, "At-rest crypto", "src/crypto.rs", "StoreBackend seam + AES-256-GCM backend; KeyProvider seam (master key off the ciphertext, never logged); fresh 96-bit nonce per put/rotate from /dev/urandom; decrypt fails closed (decrypt_failed)")
+        Component(crypto, "At-rest crypto", "src/crypto.rs", "StoreBackend seam + AES-256-GCM backend; KeyProvider seam (master key off the ciphertext, never logged); fresh 96-bit nonce per put/rotate from /dev/urandom; decrypt fails closed (decrypt_failed); hand-rolled base64 encode/decode for the store file")
+        Component(storefile, "StoreFile (persistence)", "src/store_file.rs", "OPT-IN (--store-path / VAULT_STORE_PATH), ORTHOGONAL to StoreBackend (not a new backend); serializes already-encrypted EncryptedValue + non-secret metadata to a 0600 JSON file via the StoredRecord DTO (base64 ciphertext/nonce); load on startup (ciphertext only, NO decrypt) / write-through on put+rotate (atomic: temp+chmod-0600+fsync+rename); key NEVER on disk, handles NEVER persist; refuse-to-start on corrupt file; store_persist_failed on write error")
         Component(handle, "Handle generator", "src/handle.rs", "32 random bytes from /dev/urandom (OS CSPRNG), hex-encoded; opaque single-use capability token")
     }
 
@@ -72,6 +73,8 @@ C4Component
     Rel(main, core, "dispatch op -> put/get/list/rotate/resolve/inject")
     Rel(http, core, "GET read -> resolve (value-free); health = no store access")
     Rel(core, crypto, "encrypt on put/rotate; decrypt on inject (StoreBackend seam)")
+    Rel(core, storefile, "load on startup (ciphertext only) / persist on put+rotate (--store-path); never handles, never key")
+    Rel(storefile, crypto, "base64 encode/decode the EncryptedValue bytes (no decrypt)")
     Rel(core, handle, "new_handle() on resolve")
     Rel(core, sandbox, "credential delivered at inject (injection edge)")
 ```
@@ -95,6 +98,12 @@ C4Component
 - The stored value is **AES-256-GCM ciphertext at rest** (ADR-005): `put`/`rotate` encrypt with a
   fresh 96-bit nonce, `inject` decrypts at the edge, and the master key comes from a key-provider
   seam — never beside the ciphertext. A tampered ciphertext fails `decrypt_failed` (no value).
+- **Persistence is opt-in and orthogonal to the StoreBackend seam** (ADR-008): the `StoreFile` layer
+  (`src/store_file.rs`) serializes the *already-encrypted* `EncryptedValue`s + non-secret metadata to
+  a `0600` JSON file via the `StoredRecord` DTO — **ciphertext only, key off disk, handles never
+  persist**. It loads on startup (no decrypt) and writes-through atomically on `put`/`rotate`; a
+  corrupt file refuses to start, a failed write surfaces `store_persist_failed`. Unset `--store-path`
+  ⇒ in-memory only, today's behavior unchanged.
 - Every unmatched path is **fail-closed** — a structured error, no credential delivered (ADR-001 §8).
 
 ---
