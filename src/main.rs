@@ -15,6 +15,7 @@ mod handle;
 mod http;
 mod store_file;
 mod vault;
+mod zeroize;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};

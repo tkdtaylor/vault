@@ -23,6 +23,7 @@ use crate::crypto::{
 };
 use crate::handle::new_handle;
 use crate::store_file::{self, LoadError, RecordView};
+use crate::zeroize::{Zeroize, Zeroizing};
 
 /// Injectable clock seam — lets TTL expiry be tested deterministically without sleeping.
 ///
@@ -179,11 +180,21 @@ impl Vault {
     /// operator-supplied master key. Falls back to the unconfigured (fail-closed) backend only if
     /// the RNG read fails — never to plaintext.
     pub fn with_ephemeral_key() -> Self {
-        let backend: Box<dyn StoreBackend> =
-            match random_key().and_then(|k| AesGcmBackend::new(&InMemoryKeyProvider(k))) {
-                Ok(b) => Box::new(b),
-                Err(_) => Box::new(UnconfiguredBackend),
-            };
+        let backend: Box<dyn StoreBackend> = match random_key() {
+            Ok(k) => {
+                // Wrap the ephemeral key so this copy is wiped once the backend has loaded it into
+                // its cipher (SEC-001, ADR-009). The cipher-internal key copy is the documented
+                // residual that needs the BLOCKED `zeroize` crate.
+                let mut k = Zeroizing::new(k);
+                let built = AesGcmBackend::new(&InMemoryKeyProvider(*k));
+                k.zeroize();
+                match built {
+                    Ok(b) => Box::new(b),
+                    Err(_) => Box::new(UnconfiguredBackend),
+                }
+            }
+            Err(_) => Box::new(UnconfiguredBackend),
+        };
         Vault::with_clock_and_backend(Box::new(SystemClock), backend)
     }
 

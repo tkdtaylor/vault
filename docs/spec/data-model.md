@@ -189,6 +189,15 @@ struct StoredRecord {
   `KeyProvider`) and does AES-256-GCM. `resolve`/`inject`/callers are unchanged when the backend
   swaps; an unconfigured key yields a backend that fails closed on every op (no plaintext fallback).
 
+**Memory hygiene (best-effort, SEC-001 / ADR-009):** the key/plaintext buffers vault directly
+controls are zeroized on drop via a hand-rolled `Zeroizing<T>` wrapper (`src/zeroize.rs`,
+volatile-write + `compiler_fence`, std-only — no `zeroize` crate). Wiped: the raw key `String`, the
+decoded key buffer, the in-`AesGcmBackend::new` `[u8;32]` copy, the `random_key()` ephemeral buffer,
+and the decrypted plaintext `Vec<u8>` in `decrypt` (after the credential `String` is produced). This
+is **defense-in-depth, not a guarantee** (Rust may move a value before drop). **Residual:** the key
+copy held *inside* the `Aes256Gcm` cipher object is not wiped (needs the dep-scan-BLOCKED `zeroize`
+crate).
+
 ---
 
 ## Wire / interchange formats

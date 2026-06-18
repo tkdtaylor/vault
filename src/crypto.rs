@@ -18,6 +18,8 @@ use std::io::Read;
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 
+use crate::zeroize::{Zeroize, Zeroizing};
+
 /// AES-256-GCM nonce width in bytes (96 bits — the standard GCM nonce size).
 const NONCE_LEN: usize = 12;
 /// AES-256 key width in bytes (256 bits).
@@ -55,7 +57,10 @@ pub struct EnvKeyProvider;
 
 impl KeyProvider for EnvKeyProvider {
     fn key(&self) -> Result<[u8; KEY_LEN], String> {
-        let raw = if let Ok(path) = std::env::var("VAULT_MASTER_KEY_FILE") {
+        // The raw key material is wrapped in `Zeroizing` so it is wiped from memory on drop —
+        // including the early-return error paths below (SEC-001, ADR-009). Best-effort: a copy may
+        // already have been moved by `std::env::var` before we take ownership here.
+        let mut raw = Zeroizing::new(if let Ok(path) = std::env::var("VAULT_MASTER_KEY_FILE") {
             let mut s = String::new();
             File::open(&path)
                 .and_then(|mut f| f.read_to_string(&mut s))
@@ -67,21 +72,26 @@ impl KeyProvider for EnvKeyProvider {
             return Err(
                 "no master key configured (set VAULT_MASTER_KEY or VAULT_MASTER_KEY_FILE)".into(),
             );
-        };
-        decode_key(raw.trim())
+        });
+        let decoded = decode_key(raw.trim());
+        // Explicitly wipe the raw key material now rather than waiting for scope end.
+        raw.zeroize();
+        decoded
     }
 }
 
 /// Decode a 32-byte key from hex (64 chars) or base64. Any other length → error. Never logs the
 /// input.
 fn decode_key(s: &str) -> Result<[u8; KEY_LEN], String> {
-    let bytes = if let Some(b) = decode_hex(s) {
+    // The intermediate decoded buffer holds raw key material — wrap it so it is wiped on drop
+    // (including the error returns below), not left in a freed heap allocation (SEC-001, ADR-009).
+    let mut bytes = Zeroizing::new(if let Some(b) = decode_hex(s) {
         b
     } else if let Some(b) = decode_base64(s) {
         b
     } else {
         return Err("master key is not valid hex or base64".into());
-    };
+    });
     if bytes.len() != KEY_LEN {
         return Err(format!(
             "master key must be {KEY_LEN} bytes, got {}",
@@ -90,6 +100,7 @@ fn decode_key(s: &str) -> Result<[u8; KEY_LEN], String> {
     }
     let mut key = [0u8; KEY_LEN];
     key.copy_from_slice(&bytes);
+    bytes.zeroize();
     Ok(key)
 }
 
@@ -197,9 +208,15 @@ impl AesGcmBackend {
     /// Construct from a key provider. Fails closed if the provider cannot produce a 32-byte key —
     /// there is no plaintext fallback (REQ-003).
     pub fn new(provider: &dyn KeyProvider) -> Result<Self, String> {
-        let key_bytes = provider.key()?;
-        let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+        // `key_bytes` is the 32-byte master key vault directly controls. Wrap it so the copy held
+        // here is wiped once it has been loaded into the cipher (SEC-001, ADR-009). RESIDUAL: the
+        // key copy `Aes256Gcm::new` keeps *inside* the cipher object is NOT wiped — that would
+        // require aes-gcm's `zeroize` feature, which pulls the dep-scan-BLOCKED `zeroize` crate. See
+        // ADR-009; this residual is documented, not claimed closed.
+        let mut key_bytes = Zeroizing::new(provider.key()?);
+        let key = Key::<Aes256Gcm>::from_slice(&key_bytes[..]);
         let cipher = Aes256Gcm::new(key);
+        key_bytes.zeroize();
         Ok(AesGcmBackend { cipher })
     }
 }
@@ -218,12 +235,27 @@ impl StoreBackend for AesGcmBackend {
     }
 
     fn decrypt(&self, value: &EncryptedValue) -> Result<String, String> {
-        let pt = self
-            .cipher
-            .decrypt(Nonce::from_slice(&value.nonce), value.ciphertext.as_slice())
-            // Fail closed: a bad tag (tamper), wrong key, or truncation lands here. Never a value.
-            .map_err(|_| "decrypt_failed".to_string())?;
-        String::from_utf8(pt).map_err(|_| "decrypt_failed".to_string())
+        // The decrypted plaintext bytes are the cleartext secret. Wrap them so the intermediate
+        // `Vec<u8>` is wiped on drop — including the fail-closed error paths — rather than left in a
+        // freed heap allocation after the credential `String` is produced (SEC-001, ADR-009).
+        let mut pt = Zeroizing::new(
+            self.cipher
+                .decrypt(Nonce::from_slice(&value.nonce), value.ciphertext.as_slice())
+                // Fail closed: a bad tag (tamper), wrong key, or truncation lands here. Never a value.
+                .map_err(|_| "decrypt_failed".to_string())?,
+        );
+        // Validate UTF-8 and produce the credential `String` (handed to the injection edge). We
+        // build it from a copy so the intermediate plaintext `Vec<u8>` can be wiped here; the
+        // returned `String` is exact and complete.
+        let credential = match std::str::from_utf8(&pt) {
+            Ok(s) => s.to_owned(),
+            Err(_) => {
+                pt.zeroize();
+                return Err("decrypt_failed".to_string());
+            }
+        };
+        pt.zeroize();
+        Ok(credential)
     }
 }
 
