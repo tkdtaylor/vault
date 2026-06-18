@@ -95,6 +95,10 @@ struct Secret {
     value: String,
     injection_floor: Mode,
     binding: Binding,
+    // Bumped on every `rotate`. A handle resolved against generation N is invalidated the moment
+    // the secret advances past N — this is how rotate-invalidates-outstanding-handles is enforced
+    // (ADR-004). A freshly `put` secret starts at generation 0.
+    generation: u64,
 }
 
 struct HandleRec {
@@ -105,6 +109,9 @@ struct HandleRec {
     expires_at: u64,
     consumed: bool,
     bound_sandbox: Option<String>,
+    // The secret's generation captured at resolve time. On inject, a mismatch with the secret's
+    // current generation ⇒ the handle was resolved against a now-rotated value ⇒ `handle_invalidated`.
+    generation: u64,
 }
 
 pub struct Vault {
@@ -143,8 +150,62 @@ impl Vault {
                 value: value.to_string(),
                 injection_floor: floor,
                 binding,
+                generation: 0,
             },
         );
+    }
+
+    /// Admin: read a secret's metadata — **never the value** (REQ-001 / TC-001).
+    ///
+    /// Fail-closed: an unknown or empty `secret_ref` → `no_such_secret`. The response carries only
+    /// `{exists, injection_floor, binding}`; the stored value never appears.
+    pub fn get(&self, secret_ref: &str) -> Value {
+        let Some(secret) = self.store.get(secret_ref) else {
+            return err("no_such_secret", secret_ref);
+        };
+        json!({
+            "exists": true,
+            "injection_floor": secret.injection_floor.as_str(),
+            "binding": secret.binding,
+        })
+    }
+
+    /// Admin: list the stored `secret_ref`s with their floors — **never any value** (REQ-002 / TC-003).
+    ///
+    /// An empty store returns an empty list, not an error. Ordering is unspecified (HashMap).
+    pub fn list(&self) -> Value {
+        let secrets: Vec<Value> = self
+            .store
+            .iter()
+            .map(|(secret_ref, secret)| {
+                json!({
+                    "secret_ref": secret_ref,
+                    "injection_floor": secret.injection_floor.as_str(),
+                })
+            })
+            .collect();
+        json!({ "secrets": secrets })
+    }
+
+    /// Admin: replace a secret's value in place, preserving floor + binding — **never echoes the
+    /// value** (REQ-003 / TC-004). Bumps the secret's generation, which invalidates every
+    /// outstanding handle resolved against the old value (REQ-004 / TC-005, ADR-004).
+    ///
+    /// Fail-closed: an unknown or empty `secret_ref` → `no_such_secret`, nothing rotated.
+    pub fn rotate(&mut self, secret_ref: &str, value: &str) -> Value {
+        let Some(secret) = self.store.get_mut(secret_ref) else {
+            return err("no_such_secret", secret_ref);
+        };
+        secret.value = value.to_string();
+        // Advance the generation: every handle minted against the prior value is now stale and
+        // will be rejected with `handle_invalidated` on inject (rotate-invalidates, ADR-004).
+        secret.generation = secret.generation.saturating_add(1);
+        json!({
+            "ok": true,
+            "rotated": true,
+            "injection_floor": secret.injection_floor.as_str(),
+            "binding": secret.binding,
+        })
     }
 
     /// Agent-facing: mint an opaque single-use handle. Never returns the value.
@@ -153,6 +214,7 @@ impl Vault {
             return err("no_such_secret", secret_ref);
         };
         let floor = secret.injection_floor;
+        let generation = secret.generation;
         let handle = match new_handle() {
             Ok(h) => h,
             Err(e) => return err("rng_error", &e.to_string()),
@@ -167,6 +229,7 @@ impl Vault {
                 expires_at,
                 consumed: false,
                 bound_sandbox: None,
+                generation,
             },
         );
         json!({ "handle": handle, "ttl": ttl, "injection_mode": floor.as_str() })
@@ -177,20 +240,40 @@ impl Vault {
     pub fn inject(&mut self, handle: &str, sandbox_id: &str, requested: Option<Mode>) -> Value {
         // Read the clock before borrowing the handle record (avoids overlapping borrows of self).
         let now = self.clock.now_unix();
-        let Some(rec) = self.handles.get_mut(handle) else {
-            return err("unknown_handle", "no such handle");
+        // Snapshot the read-only handle fields needed by the precedence checks, dropping the
+        // immutable borrow before we touch `self.store` (rotation check) or re-borrow mutably.
+        let (secret_ref, handle_generation) = {
+            let Some(rec) = self.handles.get(handle) else {
+                return err("unknown_handle", "no such handle");
+            };
+            // Precedence (ADR-003): unknown_handle → consumed → expired → invalidated → binding →
+            // deliver. Consumption is checked BEFORE expiry: a handle that is both consumed and
+            // expired returns handle_consumed (the use already happened — single-use is prior).
+            if rec.consumed {
+                return err("handle_consumed", "handle already used (replay rejected)");
+            }
+            // Expired IFF now >= expires_at (exactly-at-expiry is expired; ttl=0 ⇒ immediate).
+            // No credential is delivered and the handle is left unconsumed.
+            if now >= rec.expires_at {
+                return err("handle_expired", "handle TTL has elapsed");
+            }
+            (rec.secret_ref.clone(), rec.generation)
         };
-        // Precedence (ADR-003): unknown_handle → consumed → expired → binding → deliver.
-        // Consumption is checked BEFORE expiry: a handle that is both consumed and expired
-        // returns handle_consumed (the use already happened — single-use is the prior fact).
-        if rec.consumed {
-            return err("handle_consumed", "handle already used (replay rejected)");
+        // Rotation invalidation (ADR-004): a handle minted against an earlier value is stale once
+        // the secret rotates. Checked after consumed/expired and before binding/delivery, so a
+        // pre-rotation handle can never inject the post-rotation value (no credential delivered).
+        let cur_generation = self.store.get(&secret_ref).map(|s| s.generation);
+        if cur_generation != Some(handle_generation) {
+            return err(
+                "handle_invalidated",
+                "handle resolved against a rotated secret",
+            );
         }
-        // Expired IFF now >= expires_at (exactly-at-expiry is expired; ttl=0 ⇒ immediate).
-        // No credential is delivered and the handle is left unconsumed.
-        if now >= rec.expires_at {
-            return err("handle_expired", "handle TTL has elapsed");
-        }
+        // Re-borrow the handle mutably for the binding check and the consume/bind mutation.
+        let rec = self
+            .handles
+            .get_mut(handle)
+            .expect("handle present (checked above)");
         match &rec.bound_sandbox {
             Some(s) if s != sandbox_id => {
                 return err(
@@ -209,7 +292,6 @@ impl Vault {
         }
         rec.bound_sandbox = Some(sandbox_id.to_string());
         rec.consumed = true;
-        let secret_ref = rec.secret_ref.clone();
         // env-mode auto-wipe timestamp: the moment the credential is handed to the env-setter.
         // It is the inject-time / scheduled-wipe instant per the injectable clock — proxy mode
         // does not carry a wiped_at (it has no in-sandbox value to wipe).
@@ -539,6 +621,218 @@ mod tests {
             v3.inject(&h_c, "sbx-1", Some(Mode::Proxy))["error"]["code"],
             "handle_consumed",
             "consumed-before-expired precedence (ADR-003)"
+        );
+    }
+
+    // --- Task 003: get / list / rotate admin verbs (TC-001..TC-007) ---
+
+    /// TC-001 (REQ-001): get returns floor + binding, never the value.
+    #[test]
+    fn tc001_get_returns_metadata_not_value() {
+        let v = seeded();
+        let r = v.get("vault://test/api_key");
+        assert_eq!(r["exists"], true);
+        assert_eq!(r["injection_floor"], "proxy");
+        assert_eq!(r["binding"]["host"], "api.example.com");
+        // binding defaults are reflected.
+        assert_eq!(r["binding"]["header"], "Authorization");
+        assert_eq!(r["binding"]["scheme"], "Bearer");
+        assert_eq!(r["binding"]["env_var"], "API_KEY");
+        assert!(
+            r.to_string().find("SK-SECRET").is_none(),
+            "value must never appear in get response"
+        );
+    }
+
+    /// TC-002 (REQ-001): get on an unknown ref is fail-closed (no_such_secret), no metadata/value.
+    #[test]
+    fn tc002_get_unknown_ref_is_fail_closed() {
+        let v = seeded();
+        let r = v.get("vault://nope/x");
+        assert_eq!(r["error"]["code"], "no_such_secret");
+        assert!(r.get("exists").is_none(), "no metadata on unknown ref");
+        // Edge: empty secret_ref → fail-closed error, not a panic.
+        let e = v.get("");
+        assert_eq!(e["error"]["code"], "no_such_secret");
+    }
+
+    /// TC-003 (REQ-002): list returns the stored refs with floors and no values; empty store ⇒ [].
+    #[test]
+    fn tc003_list_returns_refs_no_values() {
+        let mut v = seeded();
+        v.put(
+            "vault://test/second",
+            "SK-SECOND",
+            Mode::Env,
+            Binding {
+                host: String::new(),
+                header: "Authorization".into(),
+                scheme: "Bearer".into(),
+                env_var: "API_KEY".into(),
+            },
+        );
+        let r = v.list();
+        let refs: Vec<&str> = r["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["secret_ref"].as_str().unwrap())
+            .collect();
+        assert!(refs.contains(&"vault://test/api_key"));
+        assert!(refs.contains(&"vault://test/second"));
+        let s = r.to_string();
+        assert!(s.find("SK-SECRET").is_none(), "no value in list");
+        assert!(s.find("SK-SECOND").is_none(), "no value in list");
+
+        // Edge: empty store ⇒ empty list, not an error.
+        let empty = Vault::new();
+        let er = empty.list();
+        assert!(er.get("error").is_none(), "empty store is not an error");
+        assert_eq!(er["secrets"].as_array().unwrap().len(), 0);
+    }
+
+    /// TC-004 (REQ-003): rotate swaps the value, keeps floor + binding, echoes no value; a later
+    /// resolve→inject delivers the new value. Unknown ref ⇒ no_such_secret.
+    #[test]
+    fn tc004_rotate_swaps_value_preserves_metadata_no_echo() {
+        let mut v = Vault::new();
+        v.put(
+            "vault://test/api_key",
+            "SK-OLD",
+            Mode::Proxy,
+            Binding {
+                host: "api.example.com".into(),
+                header: "Authorization".into(),
+                scheme: "Bearer".into(),
+                env_var: "API_KEY".into(),
+            },
+        );
+        let r = v.rotate("vault://test/api_key", "SK-NEW");
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["injection_floor"], "proxy", "floor preserved");
+        assert_eq!(r["binding"]["host"], "api.example.com", "binding preserved");
+        let s = r.to_string();
+        assert!(s.find("SK-NEW").is_none(), "rotate must not echo new value");
+        assert!(s.find("SK-OLD").is_none(), "rotate must not echo old value");
+
+        // A handle resolved AFTER rotation delivers the new value normally.
+        let handle = v.resolve("vault://test/api_key", 300)["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let inj = v.inject(&handle, "sbx-1", Some(Mode::Proxy));
+        assert_eq!(inj["credential"], "SK-NEW");
+
+        // Edge: rotate an unknown ref ⇒ no_such_secret, fail-closed.
+        let e = v.rotate("vault://nope/x", "whatever");
+        assert_eq!(e["error"]["code"], "no_such_secret");
+    }
+
+    /// TC-005 (REQ-004): rotation invalidates a pre-rotation handle — it cannot inject the new
+    /// value (handle_invalidated, ADR-004). A handle resolved after rotation works normally.
+    #[test]
+    fn tc005_rotate_invalidates_pre_rotation_handle() {
+        let mut v = Vault::new();
+        v.put(
+            "vault://test/api_key",
+            "SK-OLD",
+            Mode::Proxy,
+            Binding {
+                host: "api.example.com".into(),
+                header: "Authorization".into(),
+                scheme: "Bearer".into(),
+                env_var: "API_KEY".into(),
+            },
+        );
+        // Resolve a handle against the OLD value.
+        let pre = v.resolve("vault://test/api_key", 300)["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Rotate to a NEW value.
+        v.rotate("vault://test/api_key", "SK-NEW");
+        // The pre-rotation handle must NOT deliver SK-NEW — it is invalidated.
+        let inj = v.inject(&pre, "sbx-1", Some(Mode::Proxy));
+        assert_eq!(inj["error"]["code"], "handle_invalidated");
+        assert!(
+            inj.get("credential").is_none(),
+            "no credential on an invalidated handle"
+        );
+        assert!(
+            inj.to_string().find("SK-NEW").is_none(),
+            "pre-rotation handle must never see the new value"
+        );
+
+        // A handle resolved after rotation injects the new value normally.
+        let post = v.resolve("vault://test/api_key", 300)["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            v.inject(&post, "sbx-2", Some(Mode::Proxy))["credential"],
+            "SK-NEW"
+        );
+    }
+
+    /// TC-006 (REQ-005): unknown op still surfaces unknown_op at the dispatch layer is covered in
+    /// main.rs; here we assert the in-process verbs round-trip (get/list/rotate) coexist with the
+    /// existing resolve/inject path on one Vault instance.
+    #[test]
+    fn tc006_verbs_coexist_in_process() {
+        let mut v = seeded();
+        assert_eq!(v.get("vault://test/api_key")["exists"], true);
+        assert_eq!(
+            v.list()["secrets"].as_array().unwrap().len(),
+            1,
+            "one seeded secret"
+        );
+        assert_eq!(v.rotate("vault://test/api_key", "SK-ROT")["ok"], true);
+        let handle = v.resolve("vault://test/api_key", 300)["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            v.inject(&handle, "sbx-1", Some(Mode::Proxy))["credential"],
+            "SK-ROT"
+        );
+    }
+
+    /// TC-007 (cross-cutting): no get/list/rotate response contains the value, even when the value
+    /// carries JSON-special characters.
+    #[test]
+    fn tc007_no_admin_verb_leaks_value() {
+        let tricky = r#"SK-"quote"\and{brace}:colon"#;
+        let mut v = Vault::new();
+        v.put(
+            "vault://test/api_key",
+            tricky,
+            Mode::Proxy,
+            Binding {
+                host: "api.example.com".into(),
+                header: "Authorization".into(),
+                scheme: "Bearer".into(),
+                env_var: "API_KEY".into(),
+            },
+        );
+        // Match on the raw inner substring that would survive JSON escaping.
+        let needle = "quote";
+        assert!(
+            v.get("vault://test/api_key")
+                .to_string()
+                .find(needle)
+                .is_none(),
+            "get must not leak the value"
+        );
+        assert!(
+            v.list().to_string().find(needle).is_none(),
+            "list must not leak the value"
+        );
+        assert!(
+            v.rotate("vault://test/api_key", tricky)
+                .to_string()
+                .find(needle)
+                .is_none(),
+            "rotate must not echo the value"
         );
     }
 }

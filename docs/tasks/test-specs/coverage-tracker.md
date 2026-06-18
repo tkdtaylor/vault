@@ -14,7 +14,7 @@
 |---------|---------|-----------|---------------|--------|-------------|
 | 001 | SO_PEERCRED peer-uid check on the Unix socket | `001-socket-peercred-check-test-spec.md` | TC-001…TC-005 | ✅ | L6: same-uid `serve` round-trip observed (ping/put/resolve over live socket) + L2 unit tests (`peer_uid_allowed_is_equality_not_privilege`, `unreadable_peer_cred_is_denied`); different-uid rejection unit-proven (no 2nd uid in env) |
 | 002 | TTL auto-wipe clock (enforce handle TTL + env wiped_at) | `002-ttl-auto-wipe-test-spec.md` | TC-001…TC-006 | ✅ | L5: `test result: ok. 15 passed; 0 failed` (TC-001..006 via injected clock, no sleep) + L6: live socket `resolve ttl=1` → wait 2s → `inject` → `handle_expired`; spec-verifier APPROVE (per-assertion TC-001..006) |
-| 003 | Wire get/list/rotate admin verbs (metadata-only) | `003-admin-verbs-get-list-rotate-test-spec.md` | TC-001…TC-007 | ❌ | pending — backlog |
+| 003 | Wire get/list/rotate admin verbs (metadata-only) | `003-admin-verbs-get-list-rotate-test-spec.md` | TC-001…TC-007 | ✅ | L5: `test result: ok. 24 passed; 0 failed` (TC-001..007, incl. value-absence, rotate-invalidates `handle_invalidated`, and TC-006 malformed-JSON→`bad_request`) + L6: live `serve` socket round-trip put→get→list→rotate (no value leaked; unknown ref→no_such_secret; unknown op→unknown_op); spec-verifier APPROVE after malformed-JSON gap closed |
 | 004 | Encrypted-at-rest store (AES-256-GCM, key off-ciphertext) | `004-encrypted-at-rest-store-test-spec.md` | TC-001…TC-007 | ❌ | pending — backlog |
 
 ## Status key

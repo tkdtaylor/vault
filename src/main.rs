@@ -79,11 +79,22 @@ fn handle_conn(mut stream: UnixStream, v: Arc<Mutex<Vault>>) {
     if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
         return;
     }
-    let resp = match serde_json::from_str::<Value>(&line) {
-        Ok(req) => dispatch(&req, &v),
-        Err(e) => err("bad_request", &e.to_string()),
-    };
+    let resp = handle_line(&line, &v);
     let _ = writeln!(stream, "{resp}");
+}
+
+/// Parse one newline-delimited JSON request line and route it to `dispatch`.
+///
+/// Fail-closed ingress (TC-006): a line that is not well-formed JSON yields a structured
+/// `bad_request` error rather than a panic or a dropped connection — `handle_conn` writes the
+/// response back and the connection survives. Behaviour is identical to the inlined match it
+/// replaced; this is a pure extraction so the parse→dispatch step is unit-testable without a
+/// live socket. The SO_PEERCRED peer-uid gate stays upstream in `handle_conn`, unchanged.
+fn handle_line(line: &str, v: &Arc<Mutex<Vault>>) -> Value {
+    match serde_json::from_str::<Value>(line) {
+        Ok(req) => dispatch(&req, v),
+        Err(e) => err("bad_request", &e.to_string()),
+    }
 }
 
 /// Read the connecting peer's uid from the kernel via `SO_PEERCRED`.
@@ -124,6 +135,15 @@ fn dispatch(req: &Value, v: &Arc<Mutex<Vault>>) -> Value {
             );
             json!({ "ok": true })
         }
+        Some("get") => v
+            .lock()
+            .unwrap()
+            .get(req["secret_ref"].as_str().unwrap_or("")),
+        Some("list") => v.lock().unwrap().list(),
+        Some("rotate") => v.lock().unwrap().rotate(
+            req["secret_ref"].as_str().unwrap_or(""),
+            req["value"].as_str().unwrap_or(""),
+        ),
         Some("resolve") => {
             let ttl = req["ttl"].as_u64().unwrap_or(300);
             v.lock()
@@ -199,6 +219,73 @@ mod tests {
             peer_uid_allowed(0, 0),
             "(0,0) — root server, root peer — allowed by equality"
         );
+    }
+
+    // --- Task 003: get / list / rotate dispatch (TC-006, TC-007) ---
+
+    // TC-006 / REQ-005: get/list/rotate round-trip through dispatch; unknown op → unknown_op.
+    #[test]
+    fn admin_verbs_dispatch_and_unknown_op() {
+        let v = Arc::new(Mutex::new(Vault::new()));
+        // put → get → list → rotate, then an unknown op.
+        let put = dispatch(
+            &json!({
+                "op":"put","secret_ref":"vault://test/api_key","value":"SK-OLD",
+                "injection_floor":"proxy",
+                "binding":{"host":"api.example.com","header":"Authorization","scheme":"Bearer","env_var":"API_KEY"}
+            }),
+            &v,
+        );
+        assert_eq!(put["ok"], true);
+
+        let got = dispatch(&json!({"op":"get","secret_ref":"vault://test/api_key"}), &v);
+        assert_eq!(got["exists"], true);
+        assert_eq!(got["injection_floor"], "proxy");
+        assert!(
+            got.to_string().find("SK-OLD").is_none(),
+            "get leaks no value"
+        );
+
+        let listed = dispatch(&json!({"op":"list"}), &v);
+        assert_eq!(listed["secrets"].as_array().unwrap().len(), 1);
+        assert!(
+            listed.to_string().find("SK-OLD").is_none(),
+            "list leaks no value"
+        );
+
+        let rotated = dispatch(
+            &json!({"op":"rotate","secret_ref":"vault://test/api_key","value":"SK-NEW"}),
+            &v,
+        );
+        assert_eq!(rotated["ok"], true);
+        assert!(
+            rotated.to_string().find("SK-NEW").is_none(),
+            "rotate echoes no value"
+        );
+
+        // Unknown op still → unknown_op.
+        let unknown = dispatch(&json!({"op":"frobnicate"}), &v);
+        assert_eq!(unknown["error"]["code"], "unknown_op");
+
+        // TC-007 edge: rotate-unknown-ref → no_such_secret.
+        let bad = dispatch(
+            &json!({"op":"rotate","secret_ref":"vault://nope/x","value":"y"}),
+            &v,
+        );
+        assert_eq!(bad["error"]["code"], "no_such_secret");
+    }
+
+    // TC-006 edge: a malformed JSON request line → structured `bad_request`, and a well-formed
+    // line still routes normally — so the fail-closed ingress path is exercised and "connection
+    // survives" (the helper returns a response Value rather than closing/panicking).
+    #[test]
+    fn malformed_json_line_is_bad_request() {
+        let v = Arc::new(Mutex::new(Vault::new()));
+        let bad = handle_line("not valid json{", &v);
+        assert_eq!(bad["error"]["code"], "bad_request");
+        // A well-formed line still works through the same helper — connection survives.
+        let ok = handle_line("{\"op\":\"ping\"}", &v);
+        assert_eq!(ok["ok"], true);
     }
 
     // TC-004 / REQ-004: at the gate, an unreadable peer credential is modeled as `None`, and the

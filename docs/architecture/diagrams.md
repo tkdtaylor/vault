@@ -1,6 +1,6 @@
 # Architecture Diagrams — vault
 
-**Last updated:** 2026-06-18 (task 002 — TTL expiry + injectable clock in the broker, ADR-003)
+**Last updated:** 2026-06-18 (task 003 — get/list/rotate admin verbs + rotate-invalidates-handles, ADR-004)
 
 C4-structured Mermaid diagrams plus the primary runtime sequence. See [overview.md](overview.md)
 for prose context, [decisions/](decisions/) for the ADRs referenced here, and
@@ -57,15 +57,15 @@ C4Component
     Person(operator, "Operator")
 
     Container_Boundary(boundary, "vault binary") {
-        Component(main, "CLI / IPC server", "src/main.rs", "serve & demo subcommands; bind 0600 Unix socket; SO_PEERCRED peer-uid gate (peer_uid_allowed) before dispatch; frame newline-delimited JSON; dispatch ping/put/resolve/inject")
-        Component(core, "Vault broker", "src/vault.rs", "store + handle table; put/resolve/inject; raise-only floor max(secret_floor, requested); single-use + first-use sandbox binding; TTL expiry (now >= expires_at) via injectable Clock; fail-closed errors")
+        Component(main, "CLI / IPC server", "src/main.rs", "serve & demo subcommands; bind 0600 Unix socket; SO_PEERCRED peer-uid gate (peer_uid_allowed) before dispatch; frame newline-delimited JSON; dispatch ping/put/get/list/rotate/resolve/inject")
+        Component(core, "Vault broker", "src/vault.rs", "store + handle table; put/get/list/rotate/resolve/inject; metadata-only admin verbs (never the value); raise-only floor max(secret_floor, requested); single-use + first-use sandbox binding; TTL expiry (now >= expires_at) via injectable Clock; rotate invalidates outstanding handles (per-secret generation); fail-closed errors")
         Component(handle, "Handle generator", "src/handle.rs", "32 random bytes from /dev/urandom (OS CSPRNG), hex-encoded; opaque single-use capability token")
     }
 
     Rel(agent, main, "resolve", "JSON / Unix socket")
     Rel(sandbox, main, "inject", "JSON / Unix socket")
     Rel(operator, main, "serve / demo / put", "CLI")
-    Rel(main, core, "dispatch op -> put/resolve/inject")
+    Rel(main, core, "dispatch op -> put/get/list/rotate/resolve/inject")
     Rel(core, handle, "new_handle() on resolve")
     Rel(core, sandbox, "credential delivered at inject (injection edge)")
 ```
