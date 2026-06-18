@@ -27,8 +27,9 @@ These are load-bearing — violating one breaks the security model, not just sty
   path is memory-safe by construction (no buffer overruns leaking adjacent memory). *(Enforced by
   the language.)*
 - **Plaintext crosses only the uid-restricted socket.** The vault→proxy handoff (D5) travels a
-  `0600` Unix socket. A SO_PEERCRED peer-uid check is **not yet** wired — a known gap, tracked in
-  fitness rule F-006. *(Partially enforced in `src/main.rs::serve`.)*
+  `0600` Unix socket **plus** a kernel-level `SO_PEERCRED` peer-uid assertion: each accepted
+  connection's uid must equal the server's effective uid or it is rejected fail-closed
+  (`peer_uid_denied`) before any op dispatches. *(Enforced in `src/main.rs::handle_conn`; task 001.)*
 
 ## Contract (v1 — don't break without a contracts bump)
 
@@ -36,7 +37,7 @@ These are load-bearing — violating one breaks the security model, not just sty
 resolve(secret_ref, requester_identity) -> { handle, ttl, injection_mode }       # NOT the value
 inject(handle, sandbox_identity, mode)  -> proxy: { ok, delivery, credential, binding{host,header,scheme} }
                                            env:   { ok, delivery, credential, var_name, wiped_at }
-put | get | list | rotate (admin)        # only `put` is wired in the IPC dispatch today
+put | get | list | rotate (admin)        # all four wired in the IPC dispatch (get/list/rotate are metadata-only)
 ```
 
 - **Fail-closed:** effective mode = `max(secret_floor, requested)`. vault may RAISE the injection
@@ -47,20 +48,43 @@ put | get | list | rotate (admin)        # only `put` is wired in the IPC dispat
   surfaced (A7): exec-sandbox's proxy needs them to actually inject. They cross only the
   uid-restricted vault socket — the injection edge.
 
-> TODO: `get`/`list`/`rotate` are v1 contract verbs but only `put` is implemented in the IPC
-> dispatch (`src/main.rs::dispatch`). The other admin verbs are not yet wired — flagged honestly
-> as a gap in the spec.
+All four admin verbs (`put`/`get`/`list`/`rotate`) are wired in the IPC dispatch
+(`src/main.rs::dispatch`). `get`/`list`/`rotate` are **metadata-only** — they never echo the
+secret value — and `rotate` invalidates outstanding handles for the rotated ref via a
+per-secret generation counter (`handle_invalidated`). See ADR-004.
 
-The full as-built record is [ADR-001](docs/architecture/decisions/001-foundational-stack.md).
+An **opt-in, loopback-only, read-only Vault HTTP API surface** (`src/http.rs`, `--http-addr
+127.0.0.1:PORT`) exposes `GET /v1/sys/health` and `GET /v1/secret/data/:path` → `resolve` → a
+**handle** in the Vault KV-v2 envelope — **never the value**. Value delivery and every mutation
+(`inject`/`put`/`get`/`list`/`rotate`) stay on the `SO_PEERCRED` Unix socket, unreachable over
+HTTP. See ADR-006.
+
+The store is **in-memory and encrypted at rest** (ciphertext in RAM); an **opt-in persistent
+on-disk store** (`src/store_file.rs`, `--store-path` / `VAULT_STORE_PATH`) lets secrets survive a
+restart as an atomic `0600` JSON of **ciphertext + metadata only** — the master key is **never
+written to disk** and **handles never persist** (a restart invalidates every outstanding handle).
+Key/plaintext buffers vault controls are best-effort **zeroized** on drop (`src/zeroize.rs`,
+hand-rolled — the `zeroize` crate is dep-scan-blocked on a maintainer changeover; the cipher's
+internal key copy is a documented residual). See ADR-008 / ADR-009.
+
+The full as-built record is [ADR-001](docs/architecture/decisions/001-foundational-stack.md); the
+v1 increment is recorded in ADR-002 (peer-uid), ADR-003 (TTL clock), ADR-004 (admin verbs),
+ADR-005 (encrypted-at-rest store), ADR-006 (Vault HTTP API read surface), ADR-007 (cloud
+secret-manager backend — planned), ADR-008 (persistent encrypted disk store), and ADR-009
+(secure-memory zeroization).
 
 ## Project structure
 
 ```
 src/
-  main.rs    ← entrypoint: serve / demo subcommand dispatch; IPC server (ping/put/resolve/inject)
-  vault.rs   ← Vault core: store + resolve/inject broker, Mode/Binding, inline #[cfg(test)] tests
+  main.rs    ← entrypoint: serve / demo dispatch; IPC server (ping/put/get/list/rotate/resolve/inject) + SO_PEERCRED gate; opt-in --http-addr
+  vault.rs   ← Vault core: store + resolve/inject broker, admin verbs, injectable Clock, StoreBackend/KeyProvider seams, inline tests
+  crypto.rs  ← AES-256-GCM StoreBackend + KeyProvider seam (encrypt-on-put / decrypt-at-inject), /dev/urandom nonces
+  store_file.rs ← opt-in persistent encrypted store: atomic 0600 JSON of ciphertext+metadata (key off disk, handles never persist)
+  zeroize.rs ← hand-rolled best-effort memory wipe (write_volatile + compiler_fence) for key/plaintext buffers — no zeroize crate
+  http.rs    ← loopback-only, read-only Vault HTTP API read surface (resolve → handle envelope; never the value)
   handle.rs  ← capability-handle generation (32 random bytes from /dev/urandom, hex-encoded)
-Cargo.toml   ← crate manifest (serde + serde_json only)
+Cargo.toml   ← crate manifest (serde + serde_json + nix + aes-gcm + tiny_http)
 docs/        ← spec + planning + history (the source-of-truth side)
   spec/           authoritative current-state snapshot — SPEC.md, behaviors, architecture, data-model, interfaces, configuration, fitness-functions
   architecture/   overview, diagrams.md, ADRs (decisions/)
@@ -82,9 +106,12 @@ the same change.
 
 ## Tech stack
 
-Rust (edition 2021). Single static binary. Two runtime dependencies only: `serde` + `serde_json`
-(JSON over the socket). Randomness comes from the OS CSPRNG via `/dev/urandom` — **no `rand`
-crate**. License: **PolyForm Noncommercial 1.0.0**.
+Rust (edition 2021). Single static binary. Minimal dependency floor: `serde` + `serde_json`
+(JSON over the socket), `nix` (kernel `SO_PEERCRED` peer-uid check, task 001), `aes-gcm` 0.10.3
+(encrypted-at-rest store, task 004), and `tiny_http` 0.12 (the loopback HTTP read surface, task
+005). Each addition clears dep-scan and is recorded in an ADR. Randomness — handles **and**
+AES-GCM nonces — comes from the OS CSPRNG via `/dev/urandom` — **no `rand` crate**. License:
+**PolyForm Noncommercial 1.0.0**.
 
 ## Commands
 

@@ -40,12 +40,14 @@ IPC (newline-delimited JSON): `{"op":"resolve","secret_ref":"vault://test/api_ke
 
 ## Status
 
-🚧 **v0 skeleton, v1 contract.** Working resolve/inject with single-use capability handles,
-first-use sandbox binding, fail-closed floor (`max(secret_floor, policy_raised)`), and the
-proxy/env delivery split. **Deferred (v1):** encrypted-at-rest store (AES-256-GCM + age /
-client-side encryption for store-level zero-knowledge), TTL auto-wipe clock, SPIFFE identity
-binding, SO_PEERCRED peer-uid check on the socket, Vault HTTP API compatibility, cloud-KMS /
-HSM backends. The v0 store is in-memory plaintext (per scoping).
+🚧 **v1 in progress.** Working resolve/inject with single-use capability handles, first-use
+sandbox binding, fail-closed floor (`max(secret_floor, policy_raised)`), the proxy/env delivery
+split, TTL auto-wipe clock (ADR-003), the `SO_PEERCRED` peer-uid check on the socket (ADR-002),
+the `get`/`list`/`rotate` admin verbs with rotate-invalidation (ADR-004), and an **AES-256-GCM
+encrypted-at-rest store** with the master key held off the ciphertext behind a backend seam
+(ADR-005). The store is encrypted at rest in process memory — no on-disk persistence yet.
+**Deferred:** SPIFFE identity binding, Vault HTTP API compatibility, on-disk persistence, and
+cloud-KMS / HSM backends (all behind the `vault://` / `StoreBackend` seam).
 
 ## Adapter seam & standards
 

@@ -33,7 +33,8 @@ make fitness-<rule>   # run one rule by name
 | F-003 | Single-use + first-use sandbox binding | security | A handle injects at most once and only from the sandbox it first bound to; replays → `handle_consumed`, other sandboxes → `handle_bound_to_other_sandbox` | 0 successful replays / cross-sandbox injects | `make fitness-handle-single-use` (TODO) | block | proposed | A replayable or transferable handle defeats the capability model — it would let a leaked handle be reused or stolen across sandboxes (ADR-001 §6, D5; test `replay_is_rejected`). |
 | F-004 | Fail-closed on unknown handle/secret/op | security | Every non-delivery path (unknown handle, unknown secret, unknown op, malformed request, RNG failure) returns the structured error shape, never a credential | 0 deliver-on-error paths | `make fitness-fail-closed` (TODO) | block | proposed | Deliver-on-error is the classic credential-broker regression; the safe terminal state must always be a structured error with no value delivered (ADR-001 §8, behaviors B-006). |
 | F-005 | Memory-safe language on the secret path | security | The secret-handling path stays in safe Rust — no `unsafe` blocks in `src/vault.rs` / `src/handle.rs` without a documented, reviewed justification | 0 unreviewed `unsafe` on the secret path | `make fitness-no-unsafe-secret-path` (TODO) | block | proposed | Memory safety is *why* vault is Rust — the crown-jewel path must not reintroduce the buffer-overrun / use-after-free leak class via casual `unsafe` (ADR-001 §2). |
-| F-006 | Plaintext crosses only the uid-restricted socket | security | The `serve` socket is bound `0600` **and** (target) a SO_PEERCRED peer-uid check rejects other uids | socket `0600` present; **peer-uid check is a KNOWN GAP** | `make fitness-uid-restricted-socket` (TODO) | block | proposed (**partially enforced — gap**) | The D5 handoff relies on a uid-restricted channel. `0600` is in place (`src/main.rs::serve`); the SO_PEERCRED peer-uid check is **not yet wired** (needs the `nix` crate) — this row is partially enforced and tracks the gap until it closes. |
+| F-006 | Plaintext crosses only the uid-restricted socket | security | The `serve` socket is bound `0600` **and** a SO_PEERCRED peer-uid check admits only `peer_uid == server_uid` before any op dispatches | socket `0600` present; peer-uid check wired (`peer_uid_allowed`), fail-closed | `make fitness-uid-restricted-socket` (TODO) | block | proposed (**both halves implemented; runner unwired**) | The D5 handoff relies on a uid-restricted channel. `0600` is in place and the kernel-verified `SO_PEERCRED` peer-uid check is now wired (`src/main.rs::handle_conn`, equality not privilege, fail-closed; ADR-002, tests `peer_uid_allowed_is_equality_not_privilege` / `unreadable_peer_cred_is_denied`). The gap ADR-001 noted is closed; this row stays `proposed` only because the automated runner is not yet wired. |
+| F-007 | HTTP read surface routes nothing to `inject`/`put`/`rotate`; binds loopback only | security | No `http_route` / `http_response_for` path reaches `inject`/`put`/`rotate`/`get`/`list`; the route table is closed to `Health`/`Read`(→value-free `resolve`); a non-loopback `--http-addr` is refused (no wildcard bind); no HTTP response body carries the value | 0 HTTP routes to a mutation/inject verb; 0 non-loopback binds; 0 value-leaking HTTP bodies | `make fitness-http-read-only` (TODO) | block | proposed | The HTTP read surface is unauthenticated; its safety rests on being read-only + zero-knowledge + loopback-only. A route to `inject`/`put`/`rotate` would hand an unauthenticated TCP client value delivery or store mutation; a wildcard bind would expose it remotely (ADR-006 §2/§3; tests `tc007_non_get_is_405_mutation_unreachable`, `tc008_unroutable_get_is_404_admin_unreachable`, `tc002_loopback_only_accepts_only_127`, `tc010_no_path_leaks_value`). |
 
 Categories: `structural`, `hygiene`, `performance`, `complexity`, `security`, `coverage`.
 
@@ -54,6 +55,7 @@ Severity: `block` (fails the runner) / `warn` (surfaces only).
 - F-004 ← ADR-001 §8, [behaviors.md](behaviors.md) B-006, [data-model.md](data-model.md) error shape
 - F-005 ← ADR-001 §2, [architecture.md](architecture.md) §3
 - F-006 ← ADR-001 §6/§7, [configuration.md](configuration.md) socket permissions
+- F-007 ← ADR-006 §2/§3, [behaviors.md](behaviors.md) B-017/B-018, [interfaces.md](interfaces.md) HTTP read surface
 
 ## Notes
 
@@ -61,5 +63,6 @@ Severity: `block` (fails the runner) / `warn` (surfaces only).
   the spec; a violation breaks a security promise, not just style.
 - They are `proposed` until the operator confirms and the check command exists. Don't claim a rule
   is enforced until its check command runs.
-- **F-006 is explicitly partial** — `0600` is enforced today, the SO_PEERCRED peer-uid check is a
-  known gap. Do not mark F-006 fully active until the peer-uid check is wired.
+- **F-006 — both halves implemented.** `0600` is enforced and the SO_PEERCRED peer-uid check is now
+  wired (`src/main.rs::handle_conn`, ADR-002). The row stays `proposed` only until the automated
+  fitness runner exists; the rule itself is no longer a gap.

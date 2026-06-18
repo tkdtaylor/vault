@@ -20,8 +20,14 @@ Pull-triggered push (D1): exec-sandbox presents `{handle, sandbox_identity}` at 
   `handle_bound_to_other_sandbox`.
 
 ### `put | get | list | rotate` (admin)
-`put{secret_ref, value, injection_floor, binding}` seeds a secret. get/list/rotate return
-metadata, never the value.
+`put{secret_ref, value, injection_floor, binding}` seeds a secret. **All four admin verbs are wired**
+in the IPC dispatch and the in-process `Vault` API. get/list/rotate return metadata, **never the
+value**:
+- `get{secret_ref}` → `{exists, injection_floor, binding}`; unknown ref → `no_such_secret`.
+- `list` → `{secrets:[{secret_ref, injection_floor},…]}`; empty store → `[]`.
+- `rotate{secret_ref, value}` → replaces the value in place (floor + binding preserved), echoes no
+  value; unknown ref → `no_such_secret`. **Rotation invalidates outstanding handles** for that ref:
+  a handle resolved before the rotate is rejected `handle_invalidated` on inject (ADR-004).
 
 ## The vault→proxy handoff (D5)
 

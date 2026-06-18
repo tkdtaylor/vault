@@ -34,18 +34,18 @@ not a trade-off.
 
 | # | Work | Status |
 |---|------|--------|
-| 1 | **SO_PEERCRED peer-uid check on the socket** — completes the D5 handoff scheme. Today the socket is uid-restricted by 0600 file perms only; add a kernel-level peer-uid assertion (`SO_PEERCRED`) so a caller's uid is verified, not just inferred from perms. | ✅ ready — **task 001** |
-| 2 | **TTL auto-wipe clock** — `ttl` is stored on the handle but not enforced (`#[allow(dead_code)]` in `vault.rs`). Expire handles past their TTL (`resolve` → `inject` window), and fill the env-mode `wiped_at` timestamp instead of the `0` placeholder. | ✅ ready — **task 002** |
-| 3 | **Wire `get`/`list`/`rotate` admin verbs** — the contract defines them (metadata only, never the value) but only `put` is in the IPC `dispatch` today. Add the three verbs, value-free, fail-closed. | ✅ ready — **task 003** |
-| 4 | **Encrypted-at-rest store** — the headline store-level zero-knowledge upgrade. AES-256-GCM with client-side / age-style encryption so the v0 in-memory plaintext store becomes encrypted-at-rest; the key never lands beside the ciphertext. Behind the backend seam. | ✅ ready — **task 004** |
-| 5 | **Vault HTTP API compatibility** — expose the `vault://` path semantics over the Vault HTTP API shape so existing Vault clients/backends interoperate through the seam. | 🔜 planned (larger; sequence after 001–004) |
+| 1 | **SO_PEERCRED peer-uid check on the socket** — completes the D5 handoff scheme. Today the socket is uid-restricted by 0600 file perms only; add a kernel-level peer-uid assertion (`SO_PEERCRED`) so a caller's uid is verified, not just inferred from perms. | ✅ shipped — **task 001** (ADR-002) |
+| 2 | **TTL auto-wipe clock** — `ttl` is stored on the handle but not enforced (`#[allow(dead_code)]` in `vault.rs`). Expire handles past their TTL (`resolve` → `inject` window), and fill the env-mode `wiped_at` timestamp instead of the `0` placeholder. | ✅ shipped — **task 002** (ADR-003) |
+| 3 | **Wire `get`/`list`/`rotate` admin verbs** — the contract defines them (metadata only, never the value) but only `put` is in the IPC `dispatch` today. Add the three verbs, value-free, fail-closed. | ✅ shipped — **task 003** (ADR-004) |
+| 4 | **Encrypted-at-rest store** — the headline store-level zero-knowledge upgrade. AES-256-GCM with client-side / age-style encryption so the v0 in-memory plaintext store becomes encrypted-at-rest; the key never lands beside the ciphertext. Behind the backend seam. | ✅ shipped — **task 004** (ADR-005, `aes-gcm 0.10.3`) |
+| 5 | **Vault HTTP API compatibility** — expose the `vault://` path semantics over the Vault HTTP API shape so existing Vault clients/backends interoperate through the seam. Shipped as a **zero-knowledge, read-only, loopback-only** surface (`GET /v1/sys/health`, `GET /v1/secret/data/:path` → `resolve` → handle in the KV-v2 envelope, **never the value**); value delivery + all mutation stay on the `SO_PEERCRED` Unix socket. | ✅ shipped — **task 005** (ADR-006, `tiny_http 0.12`) |
 | 6 | **SPIFFE identity binding** — bind handles to SPIFFE workload identities instead of opaque `sandbox_id` strings. | ⛔ **blocked** (external identity from agent-mesh) — see *Remaining work* → R1. |
 | 7 | **Cloud-KMS / HSM backends** — PKCS#11 HSM and AWS/GCP/Azure secret-manager backends behind the `vault://` seam. | 🔜 planned (larger; external deps; sequence after 004) |
 
-Tasks 001–004 are the executable v1 increment **within this repo** — self-contained, no external
-blockers, concrete acceptance criteria. They are the autopilot runway. Rows 5 and 7 are larger
-and sequenced after the core; row 6 is externally blocked (below). The working v0 source is **not
-rewritten** — v1 work extends it behind the contract + backend seam.
+Tasks 001–005 are the executable v1 increment **within this repo** — self-contained, no external
+blockers, concrete acceptance criteria — and are all shipped (✅ verified). Row 7 is larger with
+external deps and stops on a product decision (R2, below); row 6 is externally blocked (below). The
+working v0 source is **not rewritten** — v1 work extends it behind the contract + backend seam.
 
 ## Remaining work — blocked / decisions needed
 
