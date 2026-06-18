@@ -43,17 +43,22 @@ points* ([interfaces.md](interfaces.md)).
 - **Trigger:** `{"op":"inject","handle":…,"sandbox_identity":{"sandbox_id":…},"mode":"env|proxy"}`
   over IPC, or `Vault::inject(handle, sandbox_id, requested)` in-process. This is the
   **pull-triggered push** — exec-sandbox presents `{handle, sandbox_identity}` at spawn.
-- **Response:** validates the handle, enforces single-use and the handle↔sandbox binding (B-004),
-  computes the **effective mode** `max(secret_floor, requested)` (B-005), marks the handle consumed
-  and bound to this sandbox, and delivers the credential **to the injection edge only**:
+- **Response:** validates the handle, rejects it if consumed (B-004) or if its TTL has elapsed
+  (B-011), enforces the handle↔sandbox binding (B-004), computes the **effective mode**
+  `max(secret_floor, requested)` (B-005), marks the handle consumed and bound to this sandbox, and
+  delivers the credential **to the injection edge only**:
   - `proxy` → `{ "ok":true, "delivery":"proxy", "credential":…, "binding":{host,header,scheme,env_var} }`
-    — the value goes to exec-sandbox's egress proxy, never into the sandbox.
-  - `env` → `{ "ok":true, "delivery":"env", "credential":…, "var_name":…, "wiped_at":0 }` — the
-    value is set as the named env var in the sandbox.
+    — the value goes to exec-sandbox's egress proxy, never into the sandbox. No `wiped_at` is
+    present (there is no in-sandbox value to wipe).
+  - `env` → `{ "ok":true, "delivery":"env", "credential":…, "var_name":…, "wiped_at":<unix_secs> }`
+    — the value is set as the named env var in the sandbox; `wiped_at` is the inject-time clock
+    value (the moment the credential is handed to the env-setter), not a placeholder.
 - **Side effects:** mutates the handle record (`consumed=true`, `bound_sandbox=<sandbox_id>`); the
   credential crosses only the uid-restricted socket to the injection edge.
-- **Failure modes:** see B-006 (unknown handle, replay, wrong sandbox) — all fail closed with the
-  structured error shape; no credential delivered.
+- **Failure modes:** see B-006 (unknown handle, replay, wrong sandbox, expired) — all fail closed
+  with the structured error shape; no credential delivered. The check order is
+  `unknown_handle → handle_consumed → handle_expired → handle_bound_to_other_sandbox → deliver`
+  (B-011).
 
 ### B-004: Enforce single-use + first-use sandbox binding (D5)
 
@@ -78,14 +83,32 @@ points* ([interfaces.md](interfaces.md)).
   exists to prevent. *(Test: `floor_cannot_be_lowered` — env requested against a proxy floor still
   delivers proxy.)*
 
+### B-011: Enforce handle TTL — reject expired handles (auto-expire)
+
+- **Trigger:** any `inject` against an **unconsumed** handle whose TTL has elapsed.
+- **Response:** at `resolve`, the handle records `expires_at = now + ttl` (clock seconds since the
+  Unix epoch; `now` from the injectable clock). At `inject`, the handle is **expired IFF
+  `now >= expires_at`** — exactly-at-expiry counts as expired. An expired handle →
+  `{error:{code:"handle_expired",…}}`, **no credential delivered**, and the handle is left
+  unconsumed. `ttl=0` ⇒ the handle expires immediately (any inject fails).
+- **Precedence:** the expiry check runs **after** the consumed check, so a handle that is both
+  consumed and expired returns `handle_consumed` (the use already happened); an expired-but-unconsumed
+  handle returns `handle_expired`.
+- **Side effects:** none on rejection; no state mutation, no credential.
+- **Failure modes:** fail-closed — an elapsed TTL is a non-delivery terminal state, no retry. The
+  production clock is the wall clock (`SystemClock`); tests inject a controllable clock.
+  *(Tests: `tc002_inject_after_expiry_is_rejected`, `tc002_exactly_at_expiry_is_expired`,
+  `tc006_precedence_expired_vs_consumed`; ADR-003.)*
+
 ### B-006: Reject a malformed, unknown, or unsupported request (fail-closed)
 
 - **Trigger:** a denied peer uid, unparseable JSON, an unknown `op`, an unknown handle, an unknown
-  secret, a consumed handle, a wrong sandbox, or an RNG failure.
+  secret, a consumed handle, an expired handle, a wrong sandbox, or an RNG failure.
 - **Response:** the structured error shape `{error:{code,message,retryable:false}}`. Codes in use:
   `peer_uid_denied` (peer uid ≠ server uid, or unreadable peer cred — B-010), `bad_request`
   (unparseable JSON), `unknown_op` (unsupported op), `no_such_secret`, `unknown_handle`,
-  `handle_consumed`, `handle_bound_to_other_sandbox`, `rng_error`.
+  `handle_consumed`, `handle_expired` (TTL elapsed — B-011), `handle_bound_to_other_sandbox`,
+  `rng_error`.
 - **Side effects:** none; the connection is closed after the single response.
 - **Failure modes:** the caller must treat any `error` response as a non-delivery (fail-closed);
   vault never delivers a credential for a malformed, unknown, or unsupported request.
@@ -158,8 +181,12 @@ points* ([interfaces.md](interfaces.md)).
   weaker requested mode never lowers a stronger stored floor.
 - **A handle is single-use and bound to one sandbox.** Replays (`handle_consumed`) and other
   sandboxes (`handle_bound_to_other_sandbox`) are rejected.
-- **Every non-delivery path fails closed.** A denied peer uid, unknown handle/secret/op, malformed
-  request, or RNG failure → the structured error shape; never a delivered credential.
+- **A handle expires.** Past its TTL (`now >= expires_at`, set as `resolve_time + ttl`) an unconsumed
+  handle is rejected with `handle_expired` and delivers nothing; a consumed handle reports
+  `handle_consumed` first (consumed-before-expired precedence).
+- **Every non-delivery path fails closed.** A denied peer uid, unknown handle/secret/op, expired
+  handle, malformed request, or RNG failure → the structured error shape; never a delivered
+  credential.
 - **The socket admits only the server's own uid.** Every accepted connection is gated by a
   kernel-verified `SO_PEERCRED` check (`peer_uid == server_uid`, equality not privilege) before any
   op is dispatched; an unreadable peer credential is denied (fail-closed). This is the

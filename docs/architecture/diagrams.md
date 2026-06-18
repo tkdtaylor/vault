@@ -1,6 +1,6 @@
 # Architecture Diagrams — vault
 
-**Last updated:** 2026-06-18 (task 001 — SO_PEERCRED peer-uid gate on the IPC server, ADR-002)
+**Last updated:** 2026-06-18 (task 002 — TTL expiry + injectable clock in the broker, ADR-003)
 
 C4-structured Mermaid diagrams plus the primary runtime sequence. See [overview.md](overview.md)
 for prose context, [decisions/](decisions/) for the ADRs referenced here, and
@@ -58,7 +58,7 @@ C4Component
 
     Container_Boundary(boundary, "vault binary") {
         Component(main, "CLI / IPC server", "src/main.rs", "serve & demo subcommands; bind 0600 Unix socket; SO_PEERCRED peer-uid gate (peer_uid_allowed) before dispatch; frame newline-delimited JSON; dispatch ping/put/resolve/inject")
-        Component(core, "Vault broker", "src/vault.rs", "store + handle table; put/resolve/inject; raise-only floor max(secret_floor, requested); single-use + first-use sandbox binding; fail-closed errors")
+        Component(core, "Vault broker", "src/vault.rs", "store + handle table; put/resolve/inject; raise-only floor max(secret_floor, requested); single-use + first-use sandbox binding; TTL expiry (now >= expires_at) via injectable Clock; fail-closed errors")
         Component(handle, "Handle generator", "src/handle.rs", "32 random bytes from /dev/urandom (OS CSPRNG), hex-encoded; opaque single-use capability token")
     }
 

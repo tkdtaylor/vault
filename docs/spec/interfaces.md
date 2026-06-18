@@ -45,7 +45,7 @@ closes after the response.
 | `ping` | `{"op":"ping"}` | `{"ok":true}` |
 | `put` | `{"op":"put","secret_ref":…,"value":…,"injection_floor":"env\|proxy","binding":{…}}` | `{"ok":true}` |
 | `resolve` | `{"op":"resolve","secret_ref":…,"ttl":<sec>}` | `{"handle":…,"ttl":…,"injection_mode":…}` — **never the value** |
-| `inject` | `{"op":"inject","handle":…,"sandbox_identity":{"sandbox_id":…},"mode":"env\|proxy"}` | proxy: `{"ok":true,"delivery":"proxy","credential":…,"binding":{…}}` · env: `{"ok":true,"delivery":"env","credential":…,"var_name":…,"wiped_at":0}` |
+| `inject` | `{"op":"inject","handle":…,"sandbox_identity":{"sandbox_id":…},"mode":"env\|proxy"}` | proxy: `{"ok":true,"delivery":"proxy","credential":…,"binding":{…}}` · env: `{"ok":true,"delivery":"env","credential":…,"var_name":…,"wiped_at":<unix_secs>}` · expired: `{"error":{"code":"handle_expired",...}}` |
 | *(peer-uid denied)* | any request from a peer whose uid ≠ the server's | `{"error":{"code":"peer_uid_denied",...}}` — no op dispatched |
 | *(other / malformed)* | any unparseable / unknown op | `{"error":{"code","message","retryable":false}}` (`bad_request` / `unknown_op`) |
 
@@ -76,7 +76,7 @@ vault makes **no outbound network calls** in v0. Its only outbound action is the
 | Target (via inject response) | Mode | Contract | Notes |
 |------------------------------|------|----------|-------|
 | exec-sandbox egress proxy | `proxy` | receives `{credential, binding{host,header,scheme,env_var}}` | the value never enters the sandbox itself |
-| exec-sandbox env-setter | `env` | receives `{credential, var_name, wiped_at}` | the value is set as `var_name` inside the sandbox |
+| exec-sandbox env-setter | `env` | receives `{credential, var_name, wiped_at}` | the value is set as `var_name` inside the sandbox; `wiped_at` is the inject-time clock (Unix secs) |
 
 vault does not call exec-sandbox proactively — `inject` is **pull-triggered**: exec-sandbox
 presents `{handle, sandbox_identity}` at spawn, and vault responds.
@@ -89,11 +89,16 @@ presents `{handle, sandbox_identity}` at spawn, and vault responds.
 
 ```rust
 impl Vault {
-    pub fn new() -> Self
+    pub fn new() -> Self                                                            // wired to SystemClock
+    pub fn with_clock(clock: Box<dyn Clock>) -> Self                                // inject a clock (tests / deterministic expiry)
     pub fn put(&mut self, secret_ref: &str, value: &str, floor: Mode, binding: Binding)
-    pub fn resolve(&mut self, secret_ref: &str, ttl: u64) -> serde_json::Value     // { handle, ttl, injection_mode } — NOT the value
-    pub fn inject(&mut self, handle: &str, sandbox_id: &str, requested: Option<Mode>) -> serde_json::Value
+    pub fn resolve(&mut self, secret_ref: &str, ttl: u64) -> serde_json::Value     // { handle, ttl, injection_mode } — NOT the value; records expires_at = now + ttl
+    pub fn inject(&mut self, handle: &str, sandbox_id: &str, requested: Option<Mode>) -> serde_json::Value  // handle_expired if now >= expires_at (after the consumed check)
 }
+
+// Injectable clock seam — SystemClock in production, a test clock for deterministic expiry.
+pub trait Clock: Send + Sync { fn now_unix(&self) -> u64; }
+pub struct SystemClock;   // wall time via std::time::SystemTime
 ```
 
 - **The seam is the `Vault` core** (`src/vault.rs`). The v0 implementation holds an in-memory store
