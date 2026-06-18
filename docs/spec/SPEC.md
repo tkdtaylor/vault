@@ -65,8 +65,10 @@ in Rust for memory safety on the secret path.
 - **Memory-safe language for the secret path.** vault is Rust. *(Enforced by the language. Proposed
   fitness rule F-005.)*
 - **Plaintext crosses only the uid-restricted socket.** The vault→proxy handoff (D5) travels a
-  `0600` Unix socket; a SO_PEERCRED peer-uid check is **not yet** wired (known gap). *(Partially
-  enforced in `src/main.rs::serve`. Proposed fitness rule F-006 — marked accordingly.)*
+  `0600` Unix socket, and every accepted connection is gated by a kernel-verified `SO_PEERCRED`
+  peer-uid check — admit iff `peer_uid == server_uid` (equality, not privilege), fail-closed on an
+  unreadable credential, before any op dispatches. *(Enforced in `src/main.rs::handle_conn` /
+  `peer_uid_allowed`; ADR-002. Proposed fitness rule F-006.)*
 - **Stable error shape.** IPC and core errors are `{error:{code,message,retryable}}`.
 
 ## Non-goals (current scope — v0)
@@ -78,8 +80,6 @@ These are stated as facts about what vault **is not yet**, not as a roadmap (pla
   client-side encryption for store-level zero-knowledge yet.
 - **Not TTL-enforcing.** `ttl` is stored on the handle but no auto-wipe clock enforces it
   (`#[allow(dead_code)] ttl` in `src/vault.rs`; `wiped_at` is a placeholder `0`).
-- **Not peer-uid-checked.** The socket is `0600` but there is no SO_PEERCRED peer-uid check (the
-  full D5 scheme calls for one; needs the `nix` crate).
 - **Not fully admin-complete.** Only `put` is wired in the IPC dispatch; `get` / `list` / `rotate`
   are v1 contract verbs not yet implemented (`src/main.rs::dispatch`).
 - **Not SPIFFE-bound / not Vault-HTTP-API-compatible / no cloud-KMS / HSM backends.** These sit

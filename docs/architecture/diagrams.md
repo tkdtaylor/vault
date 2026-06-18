@@ -1,6 +1,6 @@
 # Architecture Diagrams — vault
 
-**Last updated:** 2026-06-18 (bootstrap — baseline diagrams for the v0 skeleton / v1 contract, ADR-001)
+**Last updated:** 2026-06-18 (task 001 — SO_PEERCRED peer-uid gate on the IPC server, ADR-002)
 
 C4-structured Mermaid diagrams plus the primary runtime sequence. See [overview.md](overview.md)
 for prose context, [decisions/](decisions/) for the ADRs referenced here, and
@@ -57,7 +57,7 @@ C4Component
     Person(operator, "Operator")
 
     Container_Boundary(boundary, "vault binary") {
-        Component(main, "CLI / IPC server", "src/main.rs", "serve & demo subcommands; bind 0600 Unix socket; frame newline-delimited JSON; dispatch ping/put/resolve/inject")
+        Component(main, "CLI / IPC server", "src/main.rs", "serve & demo subcommands; bind 0600 Unix socket; SO_PEERCRED peer-uid gate (peer_uid_allowed) before dispatch; frame newline-delimited JSON; dispatch ping/put/resolve/inject")
         Component(core, "Vault broker", "src/vault.rs", "store + handle table; put/resolve/inject; raise-only floor max(secret_floor, requested); single-use + first-use sandbox binding; fail-closed errors")
         Component(handle, "Handle generator", "src/handle.rs", "32 random bytes from /dev/urandom (OS CSPRNG), hex-encoded; opaque single-use capability token")
     }
@@ -137,10 +137,13 @@ invariant.
 
 > TODO (diagrammed honestly): the **wipe** step is partial — env-mode `wiped_at` is a placeholder
 > `0` and there is no TTL auto-wipe clock yet (`src/vault.rs`, ADR-001 §6 note). The
-> **SO_PEERCRED** peer-uid check on the socket is also not yet present (socket is `0600` only).
+> **SO_PEERCRED** peer-uid check on the socket is now wired (`src/main.rs::handle_conn`, ADR-002):
+> every accept is admitted only if `peer_uid == server_uid` before dispatch (socket is `0600` *and*
+> kernel-peer-uid-gated).
 
 ADRs governing this flow: [ADR-001](decisions/001-foundational-stack.md) (zero-knowledge resolve,
-raise-only floor, single-use + first-use binding, uid-restricted socket, fail-closed). Future
+raise-only floor, single-use + first-use binding, uid-restricted socket, fail-closed) and
+[ADR-002](decisions/002-socket-peercred-check.md) (kernel-verified SO_PEERCRED peer-uid gate). Future
 evaluator/backend adoptions swap only the store behind the `vault://` seam — this sequence shape,
 the IPC framing, and the handle/binding semantics are preserved.
 

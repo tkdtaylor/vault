@@ -46,13 +46,15 @@ closes after the response.
 | `put` | `{"op":"put","secret_ref":…,"value":…,"injection_floor":"env\|proxy","binding":{…}}` | `{"ok":true}` |
 | `resolve` | `{"op":"resolve","secret_ref":…,"ttl":<sec>}` | `{"handle":…,"ttl":…,"injection_mode":…}` — **never the value** |
 | `inject` | `{"op":"inject","handle":…,"sandbox_identity":{"sandbox_id":…},"mode":"env\|proxy"}` | proxy: `{"ok":true,"delivery":"proxy","credential":…,"binding":{…}}` · env: `{"ok":true,"delivery":"env","credential":…,"var_name":…,"wiped_at":0}` |
+| *(peer-uid denied)* | any request from a peer whose uid ≠ the server's | `{"error":{"code":"peer_uid_denied",...}}` — no op dispatched |
 | *(other / malformed)* | any unparseable / unknown op | `{"error":{"code","message","retryable":false}}` (`bad_request` / `unknown_op`) |
 
-- Socket permissions are `0600` (owner-only) — the uid-restriction half of the D5 handoff.
+- Socket permissions are `0600` (owner-only). On every accepted connection vault additionally reads
+  the peer credential via **`SO_PEERCRED`** and admits it **only if** the peer uid equals the
+  server's own effective uid (`geteuid`) — kernel-verified, equality not privilege. A mismatched or
+  unreadable peer credential is rejected fail-closed with `peer_uid_denied` and **no op runs**. The
+  `0600` mode and the peer-uid assertion are the two halves of the D5 uid restriction (ADR-002).
 - Error codes and the structured error shape are in [data-model.md](data-model.md).
-
-> TODO: a **SO_PEERCRED peer-uid check** on accepted connections is part of the full D5 scheme but
-> is **not yet** implemented (`src/main.rs::serve` sets `0600` only; needs the `nix` crate).
 
 ### Contract verbs not yet wired
 
