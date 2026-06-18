@@ -50,13 +50,17 @@ baseline; `proxy` (value never enters the sandbox) is stronger. vault may raise 
 
 ## Socket permissions
 
-The `serve` socket is bound `0600` (owner-only) — the **uid-restriction** half of the secured
-vault→proxy handoff (D5): only the same uid can connect, alongside the unguessable single-use
-handle and the first-use sandbox binding.
+The `serve` socket is bound `0600` (owner-only) — the file-mode half of the secured vault→proxy
+handoff (D5): the filesystem ACL stops other uids from connecting, alongside the unguessable
+single-use handle and the first-use sandbox binding.
 
-> TODO: a **SO_PEERCRED peer-uid check** on accepted connections is part of the full D5 scheme but
-> is **not yet** implemented (needs the `nix` crate). The socket is `0600` only today
-> (`src/main.rs::serve`). Tracked as fitness rule F-006.
+On top of `0600`, every accepted connection is gated by a kernel-verified **`SO_PEERCRED` peer-uid
+check** (`src/main.rs::handle_conn`, ADR-002): vault reads the connecting peer's uid from the kernel
+and admits the connection only if it equals the server's own effective uid (`geteuid`) — equality,
+not privilege; root is denied unless it is the server's uid. A mismatched or unreadable peer
+credential is rejected fail-closed with `peer_uid_denied` and no op runs. There is no configuration
+knob for the allowed uid — it is always the server's own uid by construction. Tracked as fitness
+rule F-006.
 
 ---
 
@@ -95,9 +99,9 @@ is an obvious non-secret placeholder.
 | Aspect | Value | Notes |
 |--------|-------|-------|
 | Artifact | single static Rust binary (`vault`) | `cargo build` → `target/release/vault` |
-| Socket | Unix domain socket at `--socket` path | `chmod 0600`; co-located with the agent, not network-exposed |
+| Socket | Unix domain socket at `--socket` path | `chmod 0600` **plus** an `SO_PEERCRED` peer-uid check (admit iff peer uid == server uid); co-located with the agent, not network-exposed |
 | Ports exposed | none | IPC is a Unix socket, not a TCP port |
-| Runtime dependencies | `serde` + `serde_json` (linked-in) | no `rand` crate (RNG via `/dev/urandom`); adding a crypto crate for encrypted-at-rest makes dep-scan / code-scanner blocking gates |
+| Runtime dependencies | `serde` + `serde_json` + `nix` (socket+user; linked-in) | `nix` supplies `SO_PEERCRED`/`geteuid` for the peer-uid gate (ADR-002, dep-scan-cleared); no `rand` crate (RNG via `/dev/urandom`); adding a crypto crate for encrypted-at-rest makes dep-scan / code-scanner blocking gates |
 
 ---
 

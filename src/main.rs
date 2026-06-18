@@ -17,6 +17,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
 
+use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use nix::unistd::geteuid;
 use serde_json::{json, Value};
 
 use vault::{parse_mode, Binding, Mode, Vault};
@@ -41,8 +43,8 @@ fn serve(args: &[String]) {
     let _ = fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket).expect("bind unix socket");
     // uid-restricted local channel: 0600 limits callers to the same uid (the credential
-    // handoff travels this socket). NOTE v1 hardening: add an SO_PEERCRED peer-uid check
-    // (needs the `nix` crate) to match the tracer's full D5 scheme.
+    // handoff travels this socket). The SO_PEERCRED peer-uid check in handle_conn is the
+    // kernel-verified half of the same D5 restriction — see ADR-002.
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).ok();
     eprintln!("vault serving on {socket}");
 
@@ -55,6 +57,23 @@ fn serve(args: &[String]) {
 }
 
 fn handle_conn(mut stream: UnixStream, v: Arc<Mutex<Vault>>) {
+    // D5 kernel-verified peer-uid gate (ADR-002). Read the connecting process's uid via
+    // SO_PEERCRED and admit it ONLY if it equals this server's own effective uid. Fail-closed:
+    // an unreadable credential is a denial, never an admission — and no op is dispatched until
+    // the gate passes, so resolve/inject/put never run for a rejected peer.
+    let server_uid = geteuid().as_raw();
+    match read_peer_uid(&stream) {
+        Some(peer_uid) if peer_uid_allowed(peer_uid, server_uid) => {}
+        _ => {
+            let _ = writeln!(
+                stream,
+                "{}",
+                err("peer_uid_denied", "peer uid not permitted")
+            );
+            return;
+        }
+    }
+
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
@@ -67,12 +86,30 @@ fn handle_conn(mut stream: UnixStream, v: Arc<Mutex<Vault>>) {
     let _ = writeln!(stream, "{resp}");
 }
 
+/// Read the connecting peer's uid from the kernel via `SO_PEERCRED`.
+///
+/// Returns `None` on any read failure — the caller treats `None` as a **denial** (fail-closed,
+/// REQ-004). This is the I/O half of the gate; the pure equality decision is `peer_uid_allowed`.
+fn read_peer_uid(stream: &UnixStream) -> Option<u32> {
+    getsockopt(stream, PeerCredentials)
+        .ok()
+        .map(|cred| cred.uid())
+}
+
+/// Pure peer-uid admission decision (REQ-005): admit IFF the peer uid equals the server uid.
+///
+/// Equality, **not** privilege — uid 0 (root) connecting to a non-root server is denied unless it
+/// is the server's own uid. No I/O, total over the two uids, unit-testable without a live socket.
+fn peer_uid_allowed(peer_uid: u32, server_uid: u32) -> bool {
+    peer_uid == server_uid
+}
+
 fn dispatch(req: &Value, v: &Arc<Mutex<Vault>>) -> Value {
     match req["op"].as_str() {
         Some("ping") => json!({ "ok": true }),
         Some("put") => {
-            let binding: Binding = serde_json::from_value(req["binding"].clone())
-                .unwrap_or_else(|_| Binding {
+            let binding: Binding =
+                serde_json::from_value(req["binding"].clone()).unwrap_or_else(|_| Binding {
                     host: String::new(),
                     header: "Authorization".into(),
                     scheme: "Bearer".into(),
@@ -127,9 +164,59 @@ fn demo() {
 }
 
 fn flag(args: &[String], name: &str) -> Option<String> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1).cloned())
 }
 
 fn err(code: &str, message: &str) -> Value {
     json!({ "error": { "code": code, "message": message, "retryable": false } })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test-spec coverage map (docs/tasks/test-specs/001-socket-peercred-check-test-spec.md):
+    //   TC-001 (peer uid read on accept)      — exercised live by the same-uid `serve` round-trip
+    //                                            (ping/put/resolve over a real socket); the read is
+    //                                            `read_peer_uid` via SO_PEERCRED on every accept.
+    //   TC-002 (different uid rejected)        — the deny half of `peer_uid_allowed` below; a genuine
+    //                                            different-uid client needs a 2nd uid (root/sudo) and
+    //                                            is proven at the unit level per the spec's Notes.
+    //   TC-003 (same uid round-trips unchanged)— exercised live by the same-uid `serve` round-trip.
+    //   TC-004 (unreadable cred -> deny)       — `unreadable_peer_cred_is_denied` (fail-closed).
+    //   TC-005 (pure decision function)        — `peer_uid_allowed_is_equality_not_privilege`.
+
+    // TC-005 / REQ-002, REQ-005: the pure decision function admits IFF the uids are equal.
+    #[test]
+    fn peer_uid_allowed_is_equality_not_privilege() {
+        assert!(peer_uid_allowed(1000, 1000), "(1000,1000) must be allowed");
+        assert!(!peer_uid_allowed(1000, 1001), "(1000,1001) must be denied");
+        // root (uid 0) against a non-root server is denied — equality, not privilege.
+        assert!(!peer_uid_allowed(0, 1000), "(0,1000) must be denied");
+        assert!(
+            peer_uid_allowed(0, 0),
+            "(0,0) — root server, root peer — allowed by equality"
+        );
+    }
+
+    // TC-004 / REQ-004: at the gate, an unreadable peer credential is modeled as `None`, and the
+    // gate's match treats `None` as a denial (fail-closed) — never "allow because we couldn't
+    // tell". This proves the decision-boundary semantics without a live SO_PEERCRED socket.
+    #[test]
+    fn unreadable_peer_cred_is_denied() {
+        let server_uid = 1000u32;
+        // Mirror the exact admission pattern used in handle_conn against a None (read failure).
+        let admit = |peer: Option<u32>| matches!(peer, Some(p) if peer_uid_allowed(p, server_uid));
+        assert!(!admit(None), "unreadable credential (None) must be denied");
+        assert!(
+            admit(Some(1000)),
+            "same-uid readable credential is admitted"
+        );
+        assert!(
+            !admit(Some(1001)),
+            "different-uid readable credential is denied"
+        );
+    }
 }

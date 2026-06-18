@@ -36,14 +36,16 @@ vault indirectly via the raise-only floor, honored as `max(secret_floor, request
 
 | Name | Technology | Responsibility | Source path | Depends on |
 |------|------------|----------------|-------------|------------|
-| vault binary | Rust (edition 2021) single static binary | Store secrets, mint single-use handles (`resolve`), and broker credential delivery to the injection edge (`inject`); serve over a uid-restricted Unix socket or a one-shot demo | `src/main.rs`, `src/vault.rs`, `src/handle.rs` | `serde`, `serde_json` (only) |
+| vault binary | Rust (edition 2021) single static binary | Store secrets, mint single-use handles (`resolve`), and broker credential delivery to the injection edge (`inject`); serve over a uid-restricted Unix socket or a one-shot demo | `src/main.rs`, `src/vault.rs`, `src/handle.rs` | `serde`, `serde_json`, `nix` (socket+user, for `SO_PEERCRED`/`geteuid`) |
 
 **Invariants for this table**
 - The single container corresponds to the one binary crate `vault` (the single-binary layout,
   ADR-001 §2).
-- Runtime dependencies are **`serde` + `serde_json` only**; randomness is `/dev/urandom` (no `rand`
-  crate). Adding a crypto crate for encrypted-at-rest ends the minimal-dependency property and makes
-  dep-scan / code-scanner blocking gates (ADR-001 §2 consequences).
+- Runtime dependencies are **`serde` + `serde_json` + `nix`** (`nix` pulls `SO_PEERCRED`/`geteuid`
+  for the peer-uid gate, ADR-002, minimal `socket`+`user` features); randomness is `/dev/urandom`
+  (no `rand` crate). Each added crate makes dep-scan / code-scanner blocking gates — `nix`'s tree was
+  cleared on adoption (ADR-002); a crypto crate for encrypted-at-rest is the next such gate
+  (ADR-001 §2 consequences).
 
 ---
 
@@ -51,7 +53,7 @@ vault indirectly via the raise-only floor, honored as `max(secret_floor, request
 
 | Container | Component | Source path | Responsibility | Depends on |
 |-----------|-----------|-------------|----------------|------------|
-| vault binary | CLI / IPC server | `src/main.rs` | Parse `serve`/`demo` subcommands and `--socket`; bind the `0600` Unix socket (remove stale first); frame newline-delimited JSON; dispatch `ping`/`put`/`resolve`/`inject` over an `Arc<Mutex<Vault>>`; run the in-process demo | Vault broker |
+| vault binary | CLI / IPC server | `src/main.rs` | Parse `serve`/`demo` subcommands and `--socket`; bind the `0600` Unix socket (remove stale first); gate every accept with the kernel-verified `SO_PEERCRED` peer-uid check (`peer_uid_allowed`, equality not privilege, fail-closed) before dispatch; frame newline-delimited JSON; dispatch `ping`/`put`/`resolve`/`inject` over an `Arc<Mutex<Vault>>`; run the in-process demo | Vault broker |
 | vault binary | Vault broker | `src/vault.rs` | The in-memory store + handle table; `put`/`resolve`/`inject`; the `Mode` (env/proxy, ranked) and `Binding` types; raise-only floor `max(secret_floor, requested)`; single-use + first-use sandbox binding; fail-closed errors. The single seam every future backend replaces | Handle generator |
 | vault binary | Handle generator | `src/handle.rs` | `new_handle()` — 32 random bytes from `/dev/urandom` (OS CSPRNG), hex-encoded; the opaque single-use capability token | — (std only) |
 
@@ -72,8 +74,9 @@ vault indirectly via the raise-only floor, honored as `max(secret_floor, request
 - **Fail-closed** — every non-delivery path resolves to a structured error; no credential delivered.
   (ADR-001 §8)
 - **Memory-safe language** — Rust for the crown-jewel secret path. (ADR-001 §2)
-- **Uid-restricted Unix socket** — the D5 handoff travels a `0600` socket; a SO_PEERCRED peer-uid
-  check is **not yet** wired (known gap, fitness F-006). (ADR-001 §6, §7)
+- **Uid-restricted Unix socket** — the D5 handoff travels a `0600` socket, and every accept is gated
+  by a kernel-verified `SO_PEERCRED` peer-uid check (admit iff `peer_uid == server_uid`, fail-closed)
+  before dispatch (fitness F-006). (ADR-001 §6, §7; ADR-002)
 
 ---
 
@@ -82,5 +85,5 @@ vault indirectly via the raise-only floor, honored as `max(secret_floor, request
 - Update in the same commit as `../architecture/diagrams.md` when structure changes.
 - Supersede in place; never append. The ADR carries the *why*.
 - The drift-audit mode of the `architect` agent uses this catalog against the module graph and the
-  deployable-artifact list. The dependency set (`serde` + `serde_json`) is recorded in Container §3
-  `Depends on`; a new crate (e.g. a crypto dependency) updates that cell in the same commit.
+  deployable-artifact list. The dependency set (`serde` + `serde_json` + `nix`) is recorded in
+  Container §3 `Depends on`; a new crate (e.g. a crypto dependency) updates that cell in the same commit.

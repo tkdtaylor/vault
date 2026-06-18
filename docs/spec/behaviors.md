@@ -80,11 +80,12 @@ points* ([interfaces.md](interfaces.md)).
 
 ### B-006: Reject a malformed, unknown, or unsupported request (fail-closed)
 
-- **Trigger:** unparseable JSON, an unknown `op`, an unknown handle, an unknown secret, a consumed
-  handle, a wrong sandbox, or an RNG failure.
+- **Trigger:** a denied peer uid, unparseable JSON, an unknown `op`, an unknown handle, an unknown
+  secret, a consumed handle, a wrong sandbox, or an RNG failure.
 - **Response:** the structured error shape `{error:{code,message,retryable:false}}`. Codes in use:
-  `bad_request` (unparseable JSON), `unknown_op` (unsupported op), `no_such_secret`,
-  `unknown_handle`, `handle_consumed`, `handle_bound_to_other_sandbox`, `rng_error`.
+  `peer_uid_denied` (peer uid ≠ server uid, or unreadable peer cred — B-010), `bad_request`
+  (unparseable JSON), `unknown_op` (unsupported op), `no_such_secret`, `unknown_handle`,
+  `handle_consumed`, `handle_bound_to_other_sandbox`, `rng_error`.
 - **Side effects:** none; the connection is closed after the single response.
 - **Failure modes:** the caller must treat any `error` response as a non-delivery (fail-closed);
   vault never delivers a credential for a malformed, unknown, or unsupported request.
@@ -93,18 +94,33 @@ points* ([interfaces.md](interfaces.md)).
 
 - **Trigger:** `vault serve --socket <path>`.
 - **Response:** removes any stale socket at `<path>`, binds a Unix socket, sets permissions to
-  `0600` (owner-only — the uid restriction of the D5 handoff), logs the listen address to stderr,
-  and accepts connections, spawning a thread per connection over a shared `Arc<Mutex<Vault>>`. Each
-  connection sends one newline-delimited JSON object; ops are `ping` (→ `{"ok":true}`), `put`
-  (B-001), `resolve` (B-002), `inject` (B-003).
+  `0600` (owner-only — the file-mode half of the D5 uid restriction), logs the listen address to
+  stderr, and accepts connections, spawning a thread per connection over a shared
+  `Arc<Mutex<Vault>>`. On each accepted connection, **before any op is dispatched**, the server reads
+  the peer credential via `SO_PEERCRED` and admits the connection only if the peer uid equals the
+  server's own effective uid (B-010). Each admitted connection sends one newline-delimited JSON
+  object; ops are `ping` (→ `{"ok":true}`), `put` (B-001), `resolve` (B-002), `inject` (B-003).
 - **Side effects:** creates the socket file; spawns one OS thread per connection.
 - **Failure modes:** a missing `--socket` exits with usage error (`2`). A bind failure panics
-  (`expect("bind unix socket")`) → non-zero exit. An empty / unreadable first line closes the
-  connection with no response.
+  (`expect("bind unix socket")`) → non-zero exit. A peer-uid mismatch or unreadable peer credential
+  is rejected with `peer_uid_denied` and no op runs (B-010). An empty / unreadable first line closes
+  the connection with no response.
 
-> TODO: a **SO_PEERCRED peer-uid check** on accepted connections is part of the full D5 scheme but
-> is **not yet** implemented — `src/main.rs::serve` sets `0600` permissions only (needs the `nix`
-> crate). Tracked as fitness rule F-006.
+### B-010: Kernel-verified peer-uid admission on the socket (D5, fail-closed)
+
+- **Trigger:** any connection accepted by `serve`, evaluated before the request is read or
+  dispatched.
+- **Response:** the server reads the connecting peer's uid from the kernel via `SO_PEERCRED` and
+  computes a pure equality decision — admit **iff** `peer_uid == server_uid` (the server's effective
+  uid via `geteuid`). This is **equality, not privilege**: root (uid 0) connecting to a non-root
+  server is denied unless 0 is the server's own uid. A denied connection receives
+  `{"error":{"code":"peer_uid_denied",…}}` and is closed; **no `resolve` / `inject` / `put` runs**.
+- **Side effects:** none on denial beyond the error response; an admitted connection proceeds to
+  normal dispatch unchanged (no happy-path behavior change).
+- **Failure modes:** **fail-closed** — if the peer credential cannot be read, the connection is
+  **denied**, never admitted ("can't tell ⇒ deny"). The read failure is not propagated as a panic.
+  *(Decision function `src/main.rs::peer_uid_allowed`; tests
+  `peer_uid_allowed_is_equality_not_privilege`, `unreadable_peer_cred_is_denied`; ADR-002.)*
 
 ### B-008: One-shot in-process demonstration (`demo`)
 
@@ -142,7 +158,11 @@ points* ([interfaces.md](interfaces.md)).
   weaker requested mode never lowers a stronger stored floor.
 - **A handle is single-use and bound to one sandbox.** Replays (`handle_consumed`) and other
   sandboxes (`handle_bound_to_other_sandbox`) are rejected.
-- **Every non-delivery path fails closed.** Unknown handle/secret/op, malformed request, or RNG
-  failure → the structured error shape; never a delivered credential.
+- **Every non-delivery path fails closed.** A denied peer uid, unknown handle/secret/op, malformed
+  request, or RNG failure → the structured error shape; never a delivered credential.
+- **The socket admits only the server's own uid.** Every accepted connection is gated by a
+  kernel-verified `SO_PEERCRED` check (`peer_uid == server_uid`, equality not privilege) before any
+  op is dispatched; an unreadable peer credential is denied (fail-closed). This is the
+  kernel-verified half of the D5 uid restriction (the `0600` mode is the file-mode half).
 - **The value is never logged.** No `put`, `resolve`, `inject`, or error path emits the credential
   to stderr/stdout (except the `inject` delivery itself, which is the injection edge by design).

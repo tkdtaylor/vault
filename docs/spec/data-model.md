@@ -147,6 +147,7 @@ All current errors are `retryable:false`. Codes:
 
 | `code` | `retryable` | Trigger |
 |--------|-------------|---------|
+| `peer_uid_denied` | `false` | accepted connection whose `SO_PEERCRED` peer uid ≠ the server's effective uid, or whose peer credential cannot be read (fail-closed) — no op dispatched |
 | `bad_request` | `false` | unparseable request JSON |
 | `unknown_op` | `false` | an unsupported IPC op |
 | `no_such_secret` | `false` | `resolve` of a `secret_ref` not in the store |
