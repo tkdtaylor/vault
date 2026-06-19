@@ -115,11 +115,11 @@ failure (`rng_error`), a malformed request (`bad_request`), or an unknown op (`u
 resolve to the structured error shape — nothing is delivered. Delivering a credential is the
 justified exception, never the fallback.
 
-### 9. License — PolyForm Noncommercial 1.0.0
+### 9. License — Apache-2.0
 
-vault is licensed **PolyForm Noncommercial 1.0.0** (`Cargo.toml`
-`LicenseRef-PolyForm-Noncommercial-1.0.0`). The secret-handling broker is the value-add; PolyForm
-keeps it free for noncommercial use while reserving commercial rights.
+vault is licensed **Apache-2.0** (`Cargo.toml` `Apache-2.0`). Open-source and free to use,
+modify, and distribute, including in commercial and proprietary products; contributions are
+inbound=outbound under Apache-2.0 §5 (no CLA, DCO sign-off required).
 
 ## Consequences
 

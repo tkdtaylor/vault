@@ -10,7 +10,7 @@ boundary, into `exec-sandbox`, at the moment of execution**, then wiped.
 - **Pull-triggered push** — exec-sandbox presents `{handle, sandbox_identity}` at spawn; vault validates the binding, then delivers
 - **Single-use + first-use binding** — a replayed handle, or a second sandbox, is rejected (the secured vault→proxy handoff, D5)
 
-> Prior-art verdict: **BUILD (clean-room)** — store + resolve/inject broker + handle/identity binding. OpenBao / HashiCorp Vault (Vault HTTP API semantics) and AgentSecrets are reference designs + pluggable backends behind the `vault://` seam. The egress proxy lives in `exec-sandbox`, not here. **Language: Rust** (memory safety for the crown-jewel crypto/secret-handling path). **License: PolyForm Noncommercial 1.0.0.**
+> Prior-art verdict: **BUILD (clean-room)** — store + resolve/inject broker + handle/identity binding. OpenBao / HashiCorp Vault (Vault HTTP API semantics) and AgentSecrets are reference designs + pluggable backends behind the `vault://` seam. The egress proxy lives in `exec-sandbox`, not here. **Language: Rust** (memory safety for the crown-jewel crypto/secret-handling path). **License: Apache-2.0.**
 
 ## Contract (interface-contracts.md §2, v1)
 
@@ -54,3 +54,26 @@ cloud-KMS / HSM backends (all behind the `vault://` / `StoreBackend` seam).
 `vault://<scope>/<key>` scheme + Vault HTTP API path semantics. Pluggable backends: local
 encrypted store (default), OpenBao, HashiCorp Vault, AWS/GCP/Azure secret managers, PKCS#11
 HSM. See [docs/CONTRACT.md](docs/CONTRACT.md) and the scoping doc.
+
+## License
+
+vault is licensed under the **Apache License 2.0** — free to use, modify, and distribute, including in commercial and proprietary products. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+> **Security notice:** vault is a security tool provided **as-is, without warranty**. It does not guarantee the security of any system. See the disclaimer in [NOTICE](NOTICE).
+
+## Enterprise Support
+
+Need hardened deployments, integration help, or a support SLA? **Commercial support and consulting are available.**
+
+📧 Contact **[tools@taylorguard.me](mailto:tools@taylorguard.me)**
+
+## Sponsorship
+
+vault is independent, open-source security tooling. If it saves you time or risk, consider sponsoring continued development:
+
+- 💜 [GitHub Sponsors](https://github.com/sponsors/tkdtaylor)
+<!-- - 🤝 [Open Collective](https://opencollective.com/vault)  (uncomment once the collective exists) -->
+
+## Contributing
+
+Contributions are welcome and become part of the project under Apache-2.0. See [CONTRIBUTING.md](CONTRIBUTING.md). We use the **Developer Certificate of Origin (DCO)** — sign off your commits with `git commit -s`. No CLA required.

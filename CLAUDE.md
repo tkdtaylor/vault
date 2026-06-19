@@ -111,7 +111,7 @@ Rust (edition 2021). Single static binary. Minimal dependency floor: `serde` + `
 (encrypted-at-rest store, task 004), and `tiny_http` 0.12 (the loopback HTTP read surface, task
 005). Each addition clears dep-scan and is recorded in an ADR. Randomness — handles **and**
 AES-GCM nonces — comes from the OS CSPRNG via `/dev/urandom` — **no `rand` crate**. License:
-**PolyForm Noncommercial 1.0.0**.
+**Apache-2.0**.
 
 ## Commands
 
@@ -217,7 +217,7 @@ All commits below land on the **task branch** (`task/NNN-<slug>`), never on `mai
 | Diagram updated | `docs/architecture/diagrams.md` (with date bump) | `docs: refresh diagrams — <what changed>` |
 | Merged into main | (after `git merge task/NNN-<slug>` on `main`) | (default `Merge branch …` message) |
 
-This repo is **public** (PolyForm Noncommercial); push after each milestone if a remote is configured.
+This repo is **public** (Apache-2.0); push after each milestone if a remote is configured.
 
 ## Plan mode
 
