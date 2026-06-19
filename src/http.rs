@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! vault HTTP read surface — opt-in, loopback-only, read-only, zero-knowledge (ADR-006).
 //!
 //! Exposes exactly two endpoints in the HashiCorp Vault / OpenBao KV-v2 API shape:

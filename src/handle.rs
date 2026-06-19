@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Capability-handle generation.
 //!
 //! A handle is an unguessable single-use token (32 random bytes, hex-encoded). Randomness

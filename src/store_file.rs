@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Persistent encrypted-on-disk store — the `StoreFile` serialization layer (ADR-008).
 //!
 //! This is **orthogonal to the `StoreBackend` value-crypto seam** (ADR-008 §1): it does not

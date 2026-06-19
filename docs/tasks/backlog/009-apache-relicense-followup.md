@@ -26,6 +26,6 @@ b. **Push** — push the relicense once public/private visibility is confirmed.
 
 ## Acceptance criteria
 
-- [ ] SPDX header (`// SPDX-License-Identifier: Apache-2.0`) is the first line of every first-party
+- [x] SPDX header (`// SPDX-License-Identifier: Apache-2.0`) is the first line of every first-party
       `.rs` file under `src/`.
 - [ ] Relicense is pushed to the GitHub remote.

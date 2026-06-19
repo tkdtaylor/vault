@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Hand-rolled best-effort secure-memory zeroization (no `zeroize` crate) — addresses
 //! security-auditor finding **SEC-001** (key / plaintext not wiped from freed memory). See
 //! [ADR-009](../docs/architecture/decisions/009-secure-memory-zeroization.md).

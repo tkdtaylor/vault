@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Encrypted-at-rest store internals — the key-provider seam, the backend seam, and the
 //! production AES-256-GCM backend (ADR-005).
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! vault — JIT zero-knowledge secret store + credential broker.
 //!
 //! The agent core only ever holds an opaque handle; the plaintext is delivered to
