@@ -1,6 +1,6 @@
 # Architecture Diagrams — vault
 
-**Last updated:** 2026-06-18 (task 007 — opt-in persistent encrypted-on-disk store via the StoreFile layer, ADR-008)
+**Last updated:** 2026-06-21 (task 007 — opt-in persistent encrypted-on-disk store via the StoreFile layer, ADR-008)
 
 C4-structured Mermaid diagrams plus the primary runtime sequence. See [overview.md](overview.md)
 for prose context, [decisions/](decisions/) for the ADRs referenced here, and
@@ -143,7 +143,7 @@ sequenceDiagram
         alt ciphertext fails tag check (tampered/truncated/wrong key)
             Vault-->>Sandbox: {"error":{"code":"decrypt_failed",...}}  (no value, handle NOT consumed)
         else decrypt ok
-            Vault->>Vault: bound_sandbox = "sbx-1"; consumed = true
+            Vault->>Vault: bound_sandbox = "sbx-1", consumed = true
             alt effective == proxy
                 Vault->>Edge: credential (decrypted) + binding{host,header,scheme}
                 Vault-->>Sandbox: {"ok":true,"delivery":"proxy","credential":…,"binding":…}
