@@ -12,6 +12,17 @@ boundary, into `exec-sandbox`, at the moment of execution**, then wiped.
 
 > Prior-art verdict: **BUILD (clean-room)** — store + resolve/inject broker + handle/identity binding. OpenBao / HashiCorp Vault (Vault HTTP API semantics) and AgentSecrets are reference designs + pluggable backends behind the `vault://` seam. The egress proxy lives in `exec-sandbox`, not here. **Language: Rust** (memory safety for the crown-jewel crypto/secret-handling path). **License: Apache-2.0.**
 
+## Scope
+
+**What vault does:** a zero-knowledge secret store + just-in-time credential injection at the execution boundary — the agent never sees plaintext.
+
+**What it does *not* do (and which sibling owns it instead):**
+- Own the egress proxy, network allowlist, or isolation boundary → **exec-sandbox** (vault hands the credential to that boundary at spawn)
+- Decide whether a secret may be released → **policy-engine**
+- Cache credentials across task boundaries — injection is single-use with a raise-only floor
+
+`vault` is one block in a composable secure-agent ecosystem — each block is standalone and independently usable, and composes with its siblings over published contracts rather than absorbing their responsibilities (no central "god object").
+
 ## Contract (interface-contracts.md §2, v1)
 
 ```
@@ -72,7 +83,6 @@ Need hardened deployments, integration help, or a support SLA? **Commercial supp
 vault is independent, open-source security tooling. If it saves you time or risk, consider sponsoring continued development:
 
 - 💜 [GitHub Sponsors](https://github.com/sponsors/tkdtaylor)
-<!-- - 🤝 [Open Collective](https://opencollective.com/vault)  (uncomment once the collective exists) -->
 
 ## Contributing
 
