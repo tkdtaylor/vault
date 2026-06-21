@@ -1,9 +1,6 @@
 # vault — JIT zero-knowledge secret store & credential broker
 
-Answers one question: *does the agent core ever see a credential in plaintext?* The answer
-is **no** — not in logs, not in context, not in memory, not in the audit trail. The agent
-holds only an opaque, single-use **handle**; the plaintext is injected **at the host
-boundary, into `exec-sandbox`, at the moment of execution**, then wiped.
+Answers one question: *does the agent core ever see a credential in plaintext?* The answer is **no** — not in logs, not in context, not in memory, not in the audit trail. The agent holds only an opaque, single-use **handle**; the plaintext is injected **at the host boundary, into `exec-sandbox`, at the moment of execution**, then wiped.
 
 - **Handle indirection** — the agent's reference is structurally un-loggable (Threat A: total prevention)
 - **Tiered injection** — `env` (value into sandbox) vs `proxy` (value never enters the sandbox; Threat B: structural prevention)
@@ -49,16 +46,19 @@ IPC (newline-delimited JSON): `{"op":"resolve","secret_ref":"vault://test/api_ke
 `{"op":"inject","handle":"…","sandbox_identity":{"sandbox_id":"…"},"mode":"proxy"}`,
 `{"op":"put",…}`, `{"op":"ping"}`.
 
+## Documentation
+
+- [docs/architecture/overview.md](docs/architecture/overview.md) — system design and design principles
+- [docs/architecture/diagrams.md](docs/architecture/diagrams.md) — C4 diagrams and runtime flows
+- [docs/spec/SPEC.md](docs/spec/SPEC.md) — authoritative spec
+- [docs/plans/roadmap.md](docs/plans/roadmap.md) — roadmap and current status
+- [docs/CONTRACT.md](docs/CONTRACT.md) — the published interface contract
+
 ## Status
 
-🚧 **v1 in progress.** Working resolve/inject with single-use capability handles, first-use
-sandbox binding, fail-closed floor (`max(secret_floor, policy_raised)`), the proxy/env delivery
-split, TTL auto-wipe clock (ADR-003), the `SO_PEERCRED` peer-uid check on the socket (ADR-002),
-the `get`/`list`/`rotate` admin verbs with rotate-invalidation (ADR-004), and an **AES-256-GCM
-encrypted-at-rest store** with the master key held off the ciphertext behind a backend seam
-(ADR-005). The store is encrypted at rest in process memory — no on-disk persistence yet.
-**Deferred:** SPIFFE identity binding, Vault HTTP API compatibility, on-disk persistence, and
-cloud-KMS / HSM backends (all behind the `vault://` / `StoreBackend` seam).
+🚧 **v1 in progress.** Working resolve/inject with single-use capability handles, first-use sandbox binding, fail-closed floor (`max(secret_floor, policy_raised)`), the proxy/env delivery split, TTL auto-wipe clock (ADR-003), the `SO_PEERCRED` peer-uid check on the socket (ADR-002), the `get`/`list`/`rotate` admin verbs with rotate-invalidation (ADR-004), and an **AES-256-GCM encrypted-at-rest store** with the master key held off the ciphertext behind a backend seam (ADR-005). The store is encrypted at rest in process memory — no on-disk persistence yet.
+
+See the [roadmap](docs/plans/roadmap.md) for deferred work and planned features.
 
 ## Adapter seam & standards
 
