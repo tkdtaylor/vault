@@ -1,5 +1,6 @@
-# Architecture Overview — vault
+# Architecture Overview
 
+**Project:** vault
 **Last updated:** 2026-06-18
 
 ## System purpose

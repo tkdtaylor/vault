@@ -3,3 +3,5 @@
 .claude/sessions/
 .claude/worktrees/
 .claude/.last-checkpoint
+__pycache__/
+*.pyc
