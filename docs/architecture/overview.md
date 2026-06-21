@@ -110,7 +110,7 @@ facts, not a roadmap (planned work lives in `docs/plans/` / `docs/tasks/`):
 ## Design principles
 
 vault follows **Unix philosophy** — composability over monolithic design. The full statement lives
-in `CLAUDE.md`; the load-bearing instance here is the `vault://` backend seam: a small,
+in `AGENTS.md`; the load-bearing instance here is the `vault://` backend seam: a small,
 well-defined contract that lets independently-evolving store implementations plug in without
 entanglement. The secret-handling core itself is deliberately cohesive (a monolithic choice for
 correctness on the crown-jewel path) — composability lives at the cross-module boundary, not inside
