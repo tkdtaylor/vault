@@ -1,6 +1,6 @@
 # vault — JIT zero-knowledge secret store & credential broker
 
-Answers one question: *does the agent core ever see a credential in plaintext?* The answer is **no** — not in logs, not in context, not in memory, not in the audit trail. The agent holds only an opaque, single-use **handle**; the plaintext is injected **at the host boundary, into `exec-sandbox`, at the moment of execution**, then wiped.
+Answers one question: *does the agent core ever see a credential in plaintext?* The answer is **no** — not in logs, not in context, not in memory, not in the audit trail. The agent holds only an opaque, single-use **handle**; the plaintext is injected **at the host boundary, into [exec-sandbox](https://github.com/tkdtaylor/exec-sandbox), at the moment of execution**, then wiped.
 
 - **Handle indirection** — the agent's reference is structurally un-loggable (Threat A: total prevention)
 - **Tiered injection** — `env` (value into sandbox) vs `proxy` (value never enters the sandbox; Threat B: structural prevention)
@@ -15,7 +15,7 @@ Answers one question: *does the agent core ever see a credential in plaintext?* 
 
 **What it does *not* do (and which sibling owns it instead):**
 - Own the egress proxy, network allowlist, or isolation boundary → **exec-sandbox** (vault hands the credential to that boundary at spawn)
-- Decide whether a secret may be released → **policy-engine**
+- Decide whether a secret may be released → **[policy-engine](https://github.com/tkdtaylor/policy-engine)**
 - Cache credentials across task boundaries — injection is single-use with a raise-only floor
 
 `vault` is one block in a composable secure-agent ecosystem — each block is standalone and independently usable, and composes with its siblings over published contracts rather than absorbing their responsibilities (no central "god object").
