@@ -1,7 +1,7 @@
 # vault v1 contract
 
-Mirrors `interface-contracts.md §2` (vault), validated by the
-tracer-bullet (A2/A3 + the vault→proxy handoff micro-test, D5).
+Validated by the ecosystem tracer-bullet (A2/A3 + the vault→proxy handoff
+micro-test, D5).
 
 ## Verbs
 

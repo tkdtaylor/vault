@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! vault core — store + resolve/inject broker.
 //!
-//! Contract (interface-contracts.md §2, v1):
+//! Contract (docs/CONTRACT.md, v1):
 //! ```text
 //! resolve(secret_ref, requester_identity) -> { handle, ttl, injection_mode }   // NOT value
 //! inject(handle, sandbox_identity, mode)  -> proxy: { ok, delivery, credential, binding }

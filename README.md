@@ -20,7 +20,7 @@ Answers one question: *does the agent core ever see a credential in plaintext?* 
 
 `vault` is one block in a composable secure-agent ecosystem — each block is standalone and independently usable, and composes with its siblings over published contracts rather than absorbing their responsibilities (no central "god object").
 
-## Contract (interface-contracts.md §2, v1)
+## Contract ([docs/CONTRACT.md](docs/CONTRACT.md), v1)
 
 ```
 resolve(secret_ref, requester_identity) -> { handle, ttl, injection_mode }       # NOT the value
@@ -56,7 +56,7 @@ IPC (newline-delimited JSON): `{"op":"resolve","secret_ref":"vault://test/api_ke
 
 ## Status
 
-🚧 **v1 in progress.** Working resolve/inject with single-use capability handles, first-use sandbox binding, fail-closed floor (`max(secret_floor, policy_raised)`), the proxy/env delivery split, TTL auto-wipe clock (ADR-003), the `SO_PEERCRED` peer-uid check on the socket (ADR-002), the `get`/`list`/`rotate` admin verbs with rotate-invalidation (ADR-004), and an **AES-256-GCM encrypted-at-rest store** with the master key held off the ciphertext behind a backend seam (ADR-005). The store is encrypted at rest in process memory — no on-disk persistence yet.
+🚧 **v1 in progress.** Working resolve/inject with single-use capability handles, first-use sandbox binding, fail-closed floor (`max(secret_floor, policy_raised)`), the proxy/env delivery split, TTL auto-wipe clock (ADR-003), the `SO_PEERCRED` peer-uid check on the socket (ADR-002), the `get`/`list`/`rotate` admin verbs with rotate-invalidation (ADR-004), and an **AES-256-GCM encrypted-at-rest store** with the master key held off the ciphertext behind a backend seam (ADR-005), a **Vault-compatible HTTP read surface** (ADR-006), a **cloud secret-manager backend seam** (ADR-007), **persistent on-disk encrypted storage** (ADR-008), and **secure-memory zeroization** of key material (ADR-009).
 
 See the [roadmap](docs/plans/roadmap.md) for deferred work and planned features.
 
@@ -64,7 +64,7 @@ See the [roadmap](docs/plans/roadmap.md) for deferred work and planned features.
 
 `vault://<scope>/<key>` scheme + Vault HTTP API path semantics. Pluggable backends: local
 encrypted store (default), OpenBao, HashiCorp Vault, AWS/GCP/Azure secret managers, PKCS#11
-HSM. See [docs/CONTRACT.md](docs/CONTRACT.md) and the scoping doc.
+HSM. See [docs/CONTRACT.md](docs/CONTRACT.md).
 
 ## License
 

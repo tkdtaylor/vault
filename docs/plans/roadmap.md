@@ -7,8 +7,7 @@ boundary, into `exec-sandbox`, at the moment of execution, then wiped. The `vaul
 Vault HTTP API path semantics are the adapter seam, so the backend (local encrypted store,
 OpenBao, HashiCorp Vault, cloud KMS, HSM) can be swapped without touching callers.
 
-Authoritative design: the project's internal design notes
-+ `interface-contracts.md §2 (v1)`. As-built foundational stack:
+Authoritative contract: [docs/CONTRACT.md](../CONTRACT.md) (v1). As-built foundational stack:
 [ADR-001](../architecture/decisions/001-foundational-stack.md).
 
 ## v0 — resolve/inject broker + single-use handles + raise-only floor — ✅ shipped
