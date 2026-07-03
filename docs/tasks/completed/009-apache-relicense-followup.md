@@ -2,7 +2,7 @@
 
 **Project:** vault
 **Created:** 2026-06-19
-**Status:** backlog
+**Status:** completed
 
 ## Context
 
@@ -28,4 +28,4 @@ b. **Push** — push the relicense once public/private visibility is confirmed.
 
 - [x] SPDX header (`// SPDX-License-Identifier: Apache-2.0`) is the first line of every first-party
       `.rs` file under `src/`.
-- [ ] Relicense is pushed to the GitHub remote.
+- [x] Relicense is pushed to the GitHub remote — visibility confirmed **private** by the operator; `main` pushed to `tkdtaylor/vault`.
