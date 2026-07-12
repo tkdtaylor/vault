@@ -1,6 +1,6 @@
 # Architecture Diagrams — vault
 
-**Last updated:** 2026-07-12 (task 011 — SPIFFE identity binding at the inject dispatch edge, ADR-011; task 010 attestation verify, ADR-010)
+**Last updated:** 2026-07-12 (task 006 — cloud secret-manager backend core behind the StoreBackend seam, ADR-007; task 011 SPIFFE identity binding, ADR-011; task 010 attestation verify, ADR-010)
 
 C4-structured Mermaid diagrams plus the primary runtime sequence. See [overview.md](overview.md)
 for prose context, [decisions/](decisions/) for the ADRs referenced here, and
@@ -95,6 +95,10 @@ C4Component
 - The `vault://<scope>/<key>` scheme is the **backend adapter seam** (ADR-001 §4); inside the binary
   the **`StoreBackend` trait** (ADR-005) is the store-encryption seam — the default AES-256-GCM
   backend can be swapped for an OpenBao / cloud KMS / HSM backend without changing `resolve`/`inject`.
+  The **cloud secret-manager backend core** (ADR-007, `--secret-backend`) realizes this: a
+  `SecretManagerBackend` delegates store/fetch to a pluggable `SecretManagerClient` (encrypt→remote
+  put; decrypt→remote get at inject; fail-closed `backend_unavailable`). L2 core ships mock adapters;
+  real per-cloud adapters are task 012.
 - The stored value is **AES-256-GCM ciphertext at rest** (ADR-005): `put`/`rotate` encrypt with a
   fresh 96-bit nonce, `inject` decrypts at the edge, and the master key comes from a key-provider
   seam — never beside the ciphertext. A tampered ciphertext fails `decrypt_failed` (no value).

@@ -16,6 +16,7 @@ mod crypto;
 mod handle;
 mod http;
 mod principal;
+mod secret_manager;
 mod store_file;
 mod vault;
 mod zeroize;
@@ -87,29 +88,51 @@ fn serve(args: &[String]) {
         flag(args, "--store-path").as_deref(),
         std::env::var("VAULT_STORE_PATH").ok().as_deref(),
     );
-    let vault = match store_path {
-        Some(path) => {
-            // SEC-003 (defense-in-depth): the 0600 file protects its contents, but a
-            // group/world-writable PARENT directory lets a local attacker play temp-path games.
-            // FIX 1's O_EXCL + O_NOFOLLOW + random suffix already closes the active vector; this is
-            // a non-fatal startup WARNING (never refuse to start, never log a secret) so operators
-            // can tighten the directory posture.
-            warn_if_store_dir_writable(&path);
-            match Vault::new_persistent(path.clone()) {
-                Ok(v) => {
-                    eprintln!("vault persistent store: {}", path.display());
-                    v
-                }
-                Err(e) => {
-                    eprintln!(
-                        "vault: refusing to start — corrupt store file {}: {e}",
-                        path.display()
-                    );
-                    std::process::exit(1);
-                }
+    // Opt-in cloud secret-manager store backend (ADR-007, task 006 core). `--secret-backend <name>`
+    // selects a `SecretManagerClient` behind the `StoreBackend` seam via the documented drop-in
+    // registry (`secret_manager::make_client`); the value re-materialises via the client at inject
+    // instead of decrypting a local AES ciphertext. An unknown name refuses to start. This L2 core
+    // ships only the mock adapters (`mock`/`alt-mock`); the real per-cloud adapters are task 012.
+    // When set it supersedes `--store-path` (the remote holds the value; nothing persists locally).
+    let vault = if let Some(name) = flag(args, "--secret-backend") {
+        match secret_manager::make_client(&name) {
+            Some(client) => {
+                eprintln!("vault store backend: secret-manager ({name})");
+                Vault::with_clock_and_backend(
+                    Box::new(vault::SystemClock),
+                    Box::new(secret_manager::SecretManagerBackend::new(client)),
+                )
+            }
+            None => {
+                eprintln!("vault: refusing to start, unknown --secret-backend {name:?} (known: mock, alt-mock)");
+                std::process::exit(1);
             }
         }
-        None => Vault::new(),
+    } else {
+        match store_path {
+            Some(path) => {
+                // SEC-003 (defense-in-depth): the 0600 file protects its contents, but a
+                // group/world-writable PARENT directory lets a local attacker play temp-path games.
+                // FIX 1's O_EXCL + O_NOFOLLOW + random suffix already closes the active vector; this is
+                // a non-fatal startup WARNING (never refuse to start, never log a secret) so operators
+                // can tighten the directory posture.
+                warn_if_store_dir_writable(&path);
+                match Vault::new_persistent(path.clone()) {
+                    Ok(v) => {
+                        eprintln!("vault persistent store: {}", path.display());
+                        v
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "vault: refusing to start — corrupt store file {}: {e}",
+                            path.display()
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+            None => Vault::new(),
+        }
     };
     let v = Arc::new(Mutex::new(vault));
 
