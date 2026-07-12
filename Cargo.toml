@@ -19,8 +19,11 @@ nix = { version = "0.31", default-features = false, features = ["socket", "user"
 # AES-256-GCM AEAD for the encrypted-at-rest store (ADR-005). Pinned to the mature RustCrypto
 # 0.10.x line (pulls aead 0.5.x) — NOT the 0.11.0-rc release candidate (pulls aead 0.6.1, which
 # fails dep-scan's 48h age gate; an RC AEAD in the crown-jewel secret path is unacceptable).
-# Default features (aes + alloc) only — the 96-bit nonce comes from /dev/urandom, no `rand` crate.
-aes-gcm = "0.10.3"
+# default-features = false: aes-gcm 0.10.3's default set is ["aes", "alloc", "getrandom"], where
+# `getrandom` only powers its convenience generate_nonce()/generate_key() API, which this crate does
+# not use (the 96-bit nonce comes from /dev/urandom by hand, src/crypto.rs). Dropping it removes
+# getrandom + rand_core from the tree entirely, so no `rand`/getrandom RNG rides in behind AES-GCM.
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
 # Opt-in, loopback-only, read-only HTTP read surface in the Vault KV-v2 API shape (ADR-006). Sync,
 # thread-per-connection — mirrors the existing UnixListener model exactly; no async runtime, no
 # tokio. Pinned to 0.12; small tree (ascii/chunked_transfer/httpdate/log) — dep-scan gate on task 005.
