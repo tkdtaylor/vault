@@ -75,11 +75,16 @@ persisted to a single JSON file at `PATH` and reloaded on startup (ADR-008).
   `Secret { enc: EncryptedValue, injection_floor: Mode, binding: Binding, generation: u64 }`
   (`src/vault.rs`). The value is held as `EncryptedValue { ciphertext: Vec<u8>, nonce: [u8;12] }` —
   AES-256-GCM ciphertext (value + appended 128-bit tag) and its unique 96-bit nonce; **the cleartext
-  is never stored** (ADR-005). `generation` starts at `0` on `put` and is bumped on every `rotate`; a
-  handle resolved against generation N is invalidated once the secret advances past N (ADR-004).
+  is never stored** (ADR-005). Under the **cloud secret-manager backend** (`--secret-backend`,
+  ADR-007) the same `EncryptedValue` instead carries an **opaque remote locator** in `ciphertext`
+  (with an unused zero nonce): the value lives only in the remote store and re-materialises via the
+  client at `inject`; the in-process `Secret` still never holds the cleartext. `generation` starts at
+  `0` on `put` and is bumped on every `rotate`; a handle resolved against generation N is invalidated
+  once the secret advances past N (ADR-004).
 - **Owner:** the `Vault` value (`src/vault.rs`), behind an `Arc<Mutex<Vault>>` in the server. The
   `Vault` also holds a `Box<dyn StoreBackend>` — the store-encryption seam, `AesGcmBackend` in
-  production — which owns the master key (from the key-provider seam) in its own memory, **never
+  production (or `SecretManagerBackend` over a `SecretManagerClient` under `--secret-backend`,
+  ADR-007) — which owns the master key (from the key-provider seam) in its own memory, **never
   beside the ciphertext**.
 - **Lifetime:** process lifetime; populated by `put` (which **encrypts** the value with a fresh
   nonce), value replaced in place by `rotate` (which **re-encrypts** with a fresh nonce). Persisted
@@ -280,6 +285,7 @@ All current errors are `retryable:false`. Codes:
 | `decrypt_failed` | `false` | `inject` whose stored ciphertext fails the AES-256-GCM tag check (tampered / truncated / wrong key) — no credential, no panic (ADR-005) |
 | `encrypt_failed` | `false` | `put`/`rotate` whose encryption fails (e.g. no key configured, nonce-RNG failure); nothing is stored / the prior ciphertext is left untouched (ADR-005) |
 | `store_persist_failed` | `false` | `put`/`rotate` whose atomic write to the `--store-path` file failed (disk full, permission, fsync); the in-memory mutation is rolled back, the prior file is left intact — never a silent success (ADR-008 §4) |
+| `backend_unavailable` | `false` | under `--secret-backend` (ADR-007), a remote store/fetch that is denied / unavailable / not-found; on `inject` the fetch precedes handle consumption, so a transient failure does not burn the handle; on `put`/`rotate` nothing is stored / the prior remote value is left untouched |
 | `rng_error` | `false` | `/dev/urandom` read failure while minting a handle |
 
 ---

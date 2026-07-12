@@ -286,7 +286,7 @@ impl Vault {
             Ok(e) => e,
             // Fail closed: do not store plaintext, do not store a half-secret. The ref simply
             // does not exist until a key-configured put succeeds.
-            Err(e) => return err("encrypt_failed", &e),
+            Err(e) => return err(self.backend.store_error_code(), &e),
         };
         // Snapshot the prior entry so a persist failure can be rolled back (REQ-006: disk is the
         // source of truth; we never keep an in-memory write whose persist failed).
@@ -361,7 +361,7 @@ impl Vault {
         // failed encrypt fails closed: the old ciphertext is left untouched, nothing is rotated.
         let enc = match self.backend.encrypt(value) {
             Ok(e) => e,
-            Err(e) => return err("encrypt_failed", &e),
+            Err(e) => return err(self.backend.store_error_code(), &e),
         };
         let secret = self
             .store
@@ -487,7 +487,11 @@ impl Vault {
         let secret = self.store.get(&secret_ref).expect("secret present");
         let credential = match self.backend.decrypt(&secret.enc) {
             Ok(pt) => pt,
-            Err(_) => return err("decrypt_failed", "stored ciphertext failed authentication"),
+            // The AES backend fails here on a bad AEAD tag (`decrypt_failed`); a remote backend fails
+            // on a denied/unavailable/not-found fetch (`backend_unavailable`, ADR-007). The backend
+            // names its own code; the fetch happens BEFORE the handle is consumed, so a transient
+            // remote failure does not burn the single-use handle.
+            Err(e) => return err(self.backend.fetch_error_code(), &e),
         };
         // Re-read the immutable fields we still need, then consume + bind (single-use, first-use).
         let secret = self.store.get(&secret_ref).expect("secret present");

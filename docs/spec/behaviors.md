@@ -249,7 +249,9 @@ points* ([interfaces.md](interfaces.md)).
   (put/rotate disk write failure with `--store-path` — B-019), `attestation_missing` /
   `attestation_invalid` (inject attestation verification, only when a trust root is configured —
   B-020), `principal_missing` / `principal_invalid` (inject principal resolution, only in spiffe
-  identity-binding mode — B-021), `rng_error`.
+  identity-binding mode — B-021), `backend_unavailable` (a failed remote store/fetch under
+  `--secret-backend` — ADR-007; the fetch precedes handle consumption, so a transient failure does
+  not burn the handle), `rng_error`.
 - **Side effects:** none; the connection is closed after the single response.
 - **Failure modes:** the caller must treat any `error` response as a non-delivery (fail-closed);
   vault never delivers a credential for a malformed, unknown, or unsupported request.

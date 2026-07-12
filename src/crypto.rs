@@ -21,8 +21,10 @@ use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 
 use crate::zeroize::{Zeroize, Zeroizing};
 
-/// AES-256-GCM nonce width in bytes (96 bits — the standard GCM nonce size).
-const NONCE_LEN: usize = 12;
+/// AES-256-GCM nonce width in bytes (96 bits — the standard GCM nonce size). `pub(crate)` so a
+/// non-AES backend (the remote secret-manager backend, ADR-007) can build the `EncryptedValue`
+/// locator with a correctly-sized (unused) nonce field.
+pub(crate) const NONCE_LEN: usize = 12;
 /// AES-256 key width in bytes (256 bits).
 pub const KEY_LEN: usize = 32;
 
@@ -195,10 +197,26 @@ pub fn decode_base64(s: &str) -> Option<Vec<u8>> {
 /// crosses this seam, and the plaintext `String` it returns from [`decrypt`](StoreBackend::decrypt)
 /// is handed straight to the injection edge.
 pub trait StoreBackend: Send + Sync {
-    /// Seal a plaintext value into an [`EncryptedValue`] with a fresh unique nonce (REQ-004).
+    /// Seal a plaintext value into an [`EncryptedValue`] with a fresh unique nonce (REQ-004). For a
+    /// remote backend (ADR-007) this stores the value in the remote and returns an opaque locator.
     fn encrypt(&self, plaintext: &str) -> Result<EncryptedValue, String>;
-    /// Open a previously sealed value. Fails closed on a bad tag / wrong key / truncation.
+    /// Open a previously sealed value. Fails closed on a bad tag / wrong key / truncation. For a
+    /// remote backend this fetches the live value via the client and fails closed on a remote error.
     fn decrypt(&self, value: &EncryptedValue) -> Result<String, String>;
+
+    /// The error code `Vault` emits when this backend's [`encrypt`](StoreBackend::encrypt) (store)
+    /// fails. Default `encrypt_failed` (the AES at-rest backend). A remote backend overrides it to
+    /// `backend_unavailable` (ADR-007) so a failed remote *store* is distinguishable from a local
+    /// crypto failure. Additive default → existing backends are unchanged.
+    fn store_error_code(&self) -> &'static str {
+        "encrypt_failed"
+    }
+    /// The error code `Vault` emits when this backend's [`decrypt`](StoreBackend::decrypt) (fetch)
+    /// fails. Default `decrypt_failed` (a bad AEAD tag). A remote backend overrides it to
+    /// `backend_unavailable` (ADR-007) so a failed remote *fetch* is distinguishable from a tamper.
+    fn fetch_error_code(&self) -> &'static str {
+        "decrypt_failed"
+    }
 }
 
 /// Production backend: AES-256-GCM with the key from a [`KeyProvider`]. The key is held in this
