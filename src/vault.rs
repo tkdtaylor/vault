@@ -644,6 +644,43 @@ mod tests {
         assert_eq!(second["error"]["code"], "handle_consumed");
     }
 
+    // Task 011 (ADR-011) Vault-unit part of TC-011-003: the binding key is the discriminating key,
+    // whatever string it is (a SPIFFE URI in spiffe mode). Constructs a bound-but-unconsumed handle
+    // (the state the normal consumed-on-first-inject flow never leaves observable) and proves a
+    // different key is rejected while the bound key delivers. Also asserts the record binds to ID_A.
+    #[test]
+    fn spiffe_id_is_the_discriminating_binding_key() {
+        const ID_A: &str = "spiffe://secure-agents.local/exec-sandbox/sbx-1";
+        const ID_B: &str = "spiffe://secure-agents.local/exec-sandbox/sbx-2";
+        let mut v = seeded();
+        let handle = v.resolve("vault://test/api_key", 300)["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Force the bound-but-unconsumed state with ID_A as the binding key.
+        {
+            let rec = v.handles.get_mut(&handle).unwrap();
+            rec.bound_sandbox = Some(ID_A.to_string());
+            rec.consumed = false;
+        }
+        assert_eq!(
+            v.handles.get(&handle).unwrap().bound_sandbox,
+            Some(ID_A.to_string()),
+            "handle record binds to the spiffe_id ID_A"
+        );
+        // A DIFFERENT spiffe_id is rejected — the whole URI is the key (ID_A/ID_B differ only in the
+        // last path segment, no prefix matching).
+        let other = v.inject(&handle, ID_B, Some(Mode::Proxy));
+        assert_eq!(other["error"]["code"], "handle_bound_to_other_sandbox");
+        assert!(
+            other.get("credential").is_none(),
+            "no credential to the wrong id"
+        );
+        // The bound id (valid control) delivers — the rejection is attributable to the id.
+        let ok = v.inject(&handle, ID_A, Some(Mode::Proxy));
+        assert_eq!(ok["credential"], "SK-SECRET");
+    }
+
     #[test]
     fn floor_cannot_be_lowered() {
         // secret floor is proxy; a request for env must NOT lower it.

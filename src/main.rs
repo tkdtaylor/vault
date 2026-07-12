@@ -15,6 +15,7 @@ mod attest;
 mod crypto;
 mod handle;
 mod http;
+mod principal;
 mod store_file;
 mod vault;
 mod zeroize;
@@ -30,7 +31,27 @@ use nix::unistd::geteuid;
 use serde_json::{json, Value};
 
 use attest::{AttestError, AttestationVerifier, Ed25519Verifier, PassthroughVerifier};
+use principal::{MockIssuerResolver, PrincipalError, PrincipalResolver};
 use vault::{parse_mode, Binding, Mode, Vault};
+
+/// The identity-binding mode: which string becomes the handle's first-use binding key (ADR-011).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BindingMode {
+    /// Today's behavior: the (ADR-010 verified, else opaque caller-asserted) `sandbox_id`.
+    Sandbox,
+    /// The resolved SPIFFE workload identity `principal.spiffe_id`.
+    Spiffe,
+}
+
+/// The inject-time identity policy threaded into `dispatch`: attestation verification (ADR-010) then,
+/// in spiffe mode, principal resolution (ADR-011). Bundled into ONE object so `dispatch` stays a
+/// 3-argument function as identity gates accrete at the dispatch edge (the pipeline is peer-uid →
+/// attestation verify → principal resolve → `Vault::inject`).
+struct InjectGate {
+    verifier: Arc<dyn AttestationVerifier>,
+    binding: BindingMode,
+    resolver: Arc<dyn PrincipalResolver>,
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -130,6 +151,33 @@ fn serve(args: &[String]) {
         }
     };
 
+    // Opt-in SPIFFE identity binding (ADR-011, task 011). `--identity-binding sandbox|spiffe` wins
+    // over the `VAULT_IDENTITY_BINDING` env fallback; both absent ⇒ sandbox (today's opaque binding).
+    // spiffe mode makes the handle's first-use binding key the verified `principal.spiffe_id`. An
+    // unknown value refuses to start (fail-fast, never a silent fallback on a security mode).
+    let binding = match resolve_identity_binding(
+        flag(args, "--identity-binding").as_deref(),
+        std::env::var("VAULT_IDENTITY_BINDING").ok().as_deref(),
+    ) {
+        Ok(b) => {
+            eprintln!("vault identity binding: {b:?}");
+            b
+        }
+        Err(e) => {
+            eprintln!("vault: refusing to start, {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Bundle the inject-time identity policy (attestation verifier + binding mode + principal
+    // resolver) into one gate shared across connection threads. The mock issuer is the spiffe-mode
+    // default until agent-mesh task 008 ships its real resolver behind the same seam (ADR-011).
+    let gate = Arc::new(InjectGate {
+        verifier,
+        binding,
+        resolver: Arc::new(MockIssuerResolver),
+    });
+
     // Opt-in HTTP read surface (ADR-006). Absent → no TCP listener starts and the Unix socket
     // serves exactly as before (default posture unchanged). Present → a loopback-only, read-only
     // HTTP listener runs on its own thread, sharing the SAME Arc<Mutex<Vault>> as the Unix socket;
@@ -142,16 +190,12 @@ fn serve(args: &[String]) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let v = Arc::clone(&v);
-        let verifier = Arc::clone(&verifier);
-        std::thread::spawn(move || handle_conn(stream, v, verifier));
+        let gate = Arc::clone(&gate);
+        std::thread::spawn(move || handle_conn(stream, v, gate));
     }
 }
 
-fn handle_conn(
-    mut stream: UnixStream,
-    v: Arc<Mutex<Vault>>,
-    verifier: Arc<dyn AttestationVerifier>,
-) {
+fn handle_conn(mut stream: UnixStream, v: Arc<Mutex<Vault>>, gate: Arc<InjectGate>) {
     // D5 kernel-verified peer-uid gate (ADR-002). Read the connecting process's uid via
     // SO_PEERCRED and admit it ONLY if it equals this server's own effective uid. Fail-closed:
     // an unreadable credential is a denial, never an admission — and no op is dispatched until
@@ -174,7 +218,7 @@ fn handle_conn(
     if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
         return;
     }
-    let resp = handle_line(&line, &v, verifier.as_ref());
+    let resp = handle_line(&line, &v, &gate);
     let _ = writeln!(stream, "{resp}");
 }
 
@@ -185,9 +229,9 @@ fn handle_conn(
 /// response back and the connection survives. Behaviour is identical to the inlined match it
 /// replaced; this is a pure extraction so the parse→dispatch step is unit-testable without a
 /// live socket. The SO_PEERCRED peer-uid gate stays upstream in `handle_conn`, unchanged.
-fn handle_line(line: &str, v: &Arc<Mutex<Vault>>, verifier: &dyn AttestationVerifier) -> Value {
+fn handle_line(line: &str, v: &Arc<Mutex<Vault>>, gate: &InjectGate) -> Value {
     match serde_json::from_str::<Value>(line) {
-        Ok(req) => dispatch(&req, v, verifier),
+        Ok(req) => dispatch(&req, v, gate),
         Err(e) => err("bad_request", &e.to_string()),
     }
 }
@@ -210,7 +254,7 @@ fn peer_uid_allowed(peer_uid: u32, server_uid: u32) -> bool {
     peer_uid == server_uid
 }
 
-fn dispatch(req: &Value, v: &Arc<Mutex<Vault>>, verifier: &dyn AttestationVerifier) -> Value {
+fn dispatch(req: &Value, v: &Arc<Mutex<Vault>>, gate: &InjectGate) -> Value {
     match req["op"].as_str() {
         Some("ping") => json!({ "ok": true }),
         Some("put") => {
@@ -249,25 +293,52 @@ fn dispatch(req: &Value, v: &Arc<Mutex<Vault>>, verifier: &dyn AttestationVerifi
         }
         Some("inject") => {
             let mode = parse_mode(&req["mode"]);
-            // Attestation verification precedes the Vault call (ADR-010, same layering as the
-            // SO_PEERCRED gate): a rejected attestation returns the mapped error and `Vault::inject`
-            // is NEVER called, so a failed verification can never consume, bind, or expire-check a
-            // handle. On success the VERIFIED id (from the signed payload in Ed25519 mode; the
-            // caller-asserted id in transitional passthrough mode) is the binding key.
-            match verifier.verify(&req["sandbox_identity"]) {
-                Ok(verified_id) => v.lock().unwrap().inject(
+            // The identity pipeline runs at the dispatch edge BEFORE any Vault call (same layering
+            // as the SO_PEERCRED gate): attestation verify (ADR-010) then, in spiffe mode, principal
+            // resolve (ADR-011). A rejected gate returns the mapped error and `Vault::inject` is
+            // NEVER called, so a failed gate can never consume, bind, or expire-check a handle.
+            match inject_binding_key(gate, &req["sandbox_identity"]) {
+                Ok(binding_key) => v.lock().unwrap().inject(
                     req["handle"].as_str().unwrap_or(""),
-                    &verified_id,
+                    &binding_key,
                     mode,
                 ),
-                Err(AttestError::Missing) => err(
-                    "attestation_missing",
-                    "sandbox attestation required but not present",
-                ),
-                Err(AttestError::Invalid(reason)) => err("attestation_invalid", &reason),
+                Err(e) => e,
             }
         }
         _ => err("unknown_op", "unsupported op"),
+    }
+}
+
+/// Compute the handle's binding key for an inject, running the dispatch-edge identity pipeline:
+/// attestation verify (ADR-010) then, in spiffe mode, principal resolve (ADR-011). Returns the
+/// binding key on success, or the already-formed fail-closed error `Value` to return verbatim.
+///
+/// - **sandbox mode:** the key is the attestation-verified (or transitional caller-asserted)
+///   `sandbox_id`.
+/// - **spiffe mode:** the key is the resolved `principal.spiffe_id`; the verified `sandbox_id` still
+///   passes through the attestation gate first.
+fn inject_binding_key(gate: &InjectGate, sandbox_identity: &Value) -> Result<String, Value> {
+    let verified_id = match gate.verifier.verify(sandbox_identity) {
+        Ok(id) => id,
+        Err(AttestError::Missing) => {
+            return Err(err(
+                "attestation_missing",
+                "sandbox attestation required but not present",
+            ))
+        }
+        Err(AttestError::Invalid(reason)) => return Err(err("attestation_invalid", &reason)),
+    };
+    match gate.binding {
+        BindingMode::Sandbox => Ok(verified_id),
+        BindingMode::Spiffe => match gate.resolver.resolve(sandbox_identity) {
+            Ok(principal) => Ok(principal.spiffe_id),
+            Err(PrincipalError::Missing) => Err(err(
+                "principal_missing",
+                "workload principal required but not present",
+            )),
+            Err(PrincipalError::Invalid(reason)) => Err(err("principal_invalid", &reason)),
+        },
     }
 }
 
@@ -316,6 +387,20 @@ fn resolve_store_path(flag: Option<&str>, env: Option<&str>) -> Option<std::path
 /// precedence is unit-testable without a live `serve` (TC-001).
 fn resolve_trust_root_path(flag: Option<&str>, env: Option<&str>) -> Option<std::path::PathBuf> {
     flag.or(env).map(std::path::PathBuf::from)
+}
+
+/// Resolve the opt-in identity-binding mode: `--identity-binding` flag wins over the
+/// `VAULT_IDENTITY_BINDING` env fallback; both absent ⇒ `Sandbox` (today's opaque binding). Values
+/// are case-sensitive exactly `sandbox` / `spiffe`; anything else ⇒ `Err(String)` so `serve` refuses
+/// to start (never a silent fallback on a security mode). Pure and unit-testable (ADR-011, TC-001).
+fn resolve_identity_binding(flag: Option<&str>, env: Option<&str>) -> Result<BindingMode, String> {
+    match flag.or(env) {
+        None | Some("sandbox") => Ok(BindingMode::Sandbox),
+        Some("spiffe") => Ok(BindingMode::Spiffe),
+        Some(other) => Err(format!(
+            "unknown --identity-binding value {other:?} (expected \"sandbox\" or \"spiffe\")"
+        )),
+    }
 }
 
 /// Decode a 32-byte Ed25519 trust-root **public** key from a hex (64 chars) or base64 string,
@@ -423,14 +508,14 @@ mod tests {
                 "binding":{"host":"api.example.com","header":"Authorization","scheme":"Bearer","env_var":"API_KEY"}
             }),
             &v,
-            &PassthroughVerifier,
+            &sandbox_gate(),
         );
         assert_eq!(put["ok"], true);
 
         let got = dispatch(
             &json!({"op":"get","secret_ref":"vault://test/api_key"}),
             &v,
-            &PassthroughVerifier,
+            &sandbox_gate(),
         );
         assert_eq!(got["exists"], true);
         assert_eq!(got["injection_floor"], "proxy");
@@ -439,7 +524,7 @@ mod tests {
             "get leaks no value"
         );
 
-        let listed = dispatch(&json!({"op":"list"}), &v, &PassthroughVerifier);
+        let listed = dispatch(&json!({"op":"list"}), &v, &sandbox_gate());
         assert_eq!(listed["secrets"].as_array().unwrap().len(), 1);
         assert!(
             listed.to_string().find("SK-OLD").is_none(),
@@ -449,7 +534,7 @@ mod tests {
         let rotated = dispatch(
             &json!({"op":"rotate","secret_ref":"vault://test/api_key","value":"SK-NEW"}),
             &v,
-            &PassthroughVerifier,
+            &sandbox_gate(),
         );
         assert_eq!(rotated["ok"], true);
         assert!(
@@ -458,14 +543,14 @@ mod tests {
         );
 
         // Unknown op still → unknown_op.
-        let unknown = dispatch(&json!({"op":"frobnicate"}), &v, &PassthroughVerifier);
+        let unknown = dispatch(&json!({"op":"frobnicate"}), &v, &sandbox_gate());
         assert_eq!(unknown["error"]["code"], "unknown_op");
 
         // TC-007 edge: rotate-unknown-ref → no_such_secret.
         let bad = dispatch(
             &json!({"op":"rotate","secret_ref":"vault://nope/x","value":"y"}),
             &v,
-            &PassthroughVerifier,
+            &sandbox_gate(),
         );
         assert_eq!(bad["error"]["code"], "no_such_secret");
     }
@@ -476,10 +561,10 @@ mod tests {
     #[test]
     fn malformed_json_line_is_bad_request() {
         let v = Arc::new(Mutex::new(Vault::new()));
-        let bad = handle_line("not valid json{", &v, &PassthroughVerifier);
+        let bad = handle_line("not valid json{", &v, &sandbox_gate());
         assert_eq!(bad["error"]["code"], "bad_request");
         // A well-formed line still works through the same helper — connection survives.
-        let ok = handle_line("{\"op\":\"ping\"}", &v, &PassthroughVerifier);
+        let ok = handle_line("{\"op\":\"ping\"}", &v, &sandbox_gate());
         assert_eq!(ok["ok"], true);
     }
 
@@ -535,7 +620,7 @@ mod tests {
 
     // ===================================================================================
     // Task 010: Ed25519 attestation verification at the inject dispatch edge (ADR-010).
-    // TCs drive `dispatch(&req, &v, &verifier)` — the live path minus the socket — so a
+    // TCs drive `dispatch(&req, &v, &gate)` — the live path minus the socket — so a
     // verifier that exists but is not wired must fail (the dead-wire retro).
     // ===================================================================================
 
@@ -581,6 +666,76 @@ mod tests {
     fn resolve_one(v: &Arc<Mutex<Vault>>) -> String {
         let r = v.lock().unwrap().resolve("vault://test/api_key", 300);
         r["handle"].as_str().unwrap().to_string()
+    }
+
+    // --- InjectGate test helpers (ADR-011) ---
+
+    /// The default gate: transitional passthrough attestation + sandbox binding + mock issuer. This
+    /// is byte-for-byte today's post-ADR-010 dispatch behavior, used by the prior tests unchanged.
+    fn sandbox_gate() -> InjectGate {
+        InjectGate {
+            verifier: Arc::new(PassthroughVerifier),
+            binding: BindingMode::Sandbox,
+            resolver: Arc::new(MockIssuerResolver),
+        }
+    }
+
+    /// A gate whose attestation verifier is an `Ed25519Verifier` over `root` (sandbox binding).
+    fn ed25519_gate(root: [u8; 32]) -> InjectGate {
+        InjectGate {
+            verifier: Arc::new(Ed25519Verifier::new(root)),
+            binding: BindingMode::Sandbox,
+            resolver: Arc::new(MockIssuerResolver),
+        }
+    }
+
+    // --- Task 011: spiffe-mode gate helpers + fixtures ---
+
+    const ID_A: &str = "spiffe://secure-agents.local/exec-sandbox/sbx-1";
+    const ID_B: &str = "spiffe://secure-agents.local/exec-sandbox/sbx-2";
+
+    /// A spiffe-mode gate (passthrough attestation) over a specific principal resolver.
+    fn spiffe_gate_with(resolver: Arc<dyn PrincipalResolver>) -> InjectGate {
+        InjectGate {
+            verifier: Arc::new(PassthroughVerifier),
+            binding: BindingMode::Spiffe,
+            resolver,
+        }
+    }
+
+    /// The default spiffe-mode gate: the mock issuer reading `sandbox_identity.principal`.
+    fn spiffe_gate() -> InjectGate {
+        spiffe_gate_with(Arc::new(MockIssuerResolver))
+    }
+
+    /// An inject request carrying an agent-mesh `principal` block (mock-issuer shape).
+    fn principal_req(handle: &str, spiffe_id: &str, trust_tier: &str, mode: &str) -> Value {
+        json!({
+            "op": "inject", "handle": handle, "mode": mode,
+            "sandbox_identity": {
+                "sandbox_id": "sbx-1",
+                "principal": {"spiffe_id": spiffe_id, "trust_tier": trust_tier}
+            }
+        })
+    }
+
+    /// A second, behaviorally-distinct `PrincipalResolver` (TC-005 drop-in proof). It maps a fixed
+    /// `sandbox_identity.token` to a fixed principal — a different input mechanism than the mock
+    /// issuer's principal-block read — standing in for the real agent-mesh-backed resolver.
+    struct AltTestResolver;
+    impl PrincipalResolver for AltTestResolver {
+        fn resolve(
+            &self,
+            sandbox_identity: &Value,
+        ) -> Result<principal::VerifiedPrincipal, PrincipalError> {
+            match sandbox_identity.get("token").and_then(Value::as_str) {
+                Some("tok-A") => Ok(principal::VerifiedPrincipal {
+                    spiffe_id: ID_A.to_string(),
+                    trust_tier: "attested".to_string(),
+                }),
+                _ => Err(PrincipalError::Missing),
+            }
+        }
     }
 
     /// Build an inject request; `attestation` = `None` omits the member (today's plain shape).
@@ -667,13 +822,14 @@ mod tests {
     fn tc002_valid_attestation_delivers_and_binds_verified_id() {
         let kp = fixture_keypair(7);
         let verifier = Ed25519Verifier::new(*kp.pk);
+        let gate = ed25519_gate(*kp.pk);
         let v = attest_vault();
         let h = resolve_one(&v);
 
         let resp = dispatch(
             &inject_req(&h, "sbx-1", Some(fixture_attestation("sbx-1", &kp))),
             &v,
-            &verifier,
+            &gate,
         );
         // Byte-for-byte the existing contract response; no attestation type leaks in.
         assert_eq!(resp["ok"], true);
@@ -689,7 +845,7 @@ mod tests {
         let replay = dispatch(
             &inject_req(&h, "sbx-1", Some(fixture_attestation("sbx-1", &kp))),
             &v,
-            &verifier,
+            &gate,
         );
         assert_eq!(replay["error"]["code"], "handle_consumed");
 
@@ -708,7 +864,7 @@ mod tests {
     #[test]
     fn tc003_tampered_sig_and_payload_rejected_handle_not_burned() {
         let kp = fixture_keypair(7);
-        let verifier = Ed25519Verifier::new(*kp.pk);
+        let gate = ed25519_gate(*kp.pk);
         let v = attest_vault();
         let h = resolve_one(&v);
 
@@ -717,7 +873,7 @@ mod tests {
         let mut sig = crypto::decode_base64(att_b["signature"].as_str().unwrap()).unwrap();
         sig[0] ^= 0x01;
         att_b["signature"] = json!(crypto::encode_base64(&sig));
-        let resp_b = dispatch(&inject_req(&h, "sbx-1", Some(att_b)), &v, &verifier);
+        let resp_b = dispatch(&inject_req(&h, "sbx-1", Some(att_b)), &v, &gate);
         assert_eq!(resp_b["error"]["code"], "attestation_invalid");
         assert!(resp_b.get("ok").is_none(), "no ok on a rejection");
         assert!(
@@ -737,14 +893,14 @@ mod tests {
         let last = payload.len() - 2;
         payload[last] ^= 0x01;
         att_c["payload"] = json!(crypto::encode_base64(&payload));
-        let resp_c = dispatch(&inject_req(&h, "sbx-1", Some(att_c)), &v, &verifier);
+        let resp_c = dispatch(&inject_req(&h, "sbx-1", Some(att_c)), &v, &gate);
         assert_eq!(resp_c["error"]["code"], "attestation_invalid");
 
         // (a) valid control on the SAME handle → succeeds, so the rejections did not burn it.
         let resp_a = dispatch(
             &inject_req(&h, "sbx-1", Some(fixture_attestation("sbx-1", &kp))),
             &v,
-            &verifier,
+            &gate,
         );
         assert_eq!(resp_a["credential"], "SK-SECRET");
     }
@@ -756,7 +912,7 @@ mod tests {
     fn tc004_wrong_key_rejected_correct_key_control() {
         let good = fixture_keypair(7);
         let wrong = fixture_keypair(8);
-        let verifier = Ed25519Verifier::new(*good.pk); // trust root = good
+        let gate = ed25519_gate(*good.pk); // trust root = good
         let v = attest_vault();
         let h = resolve_one(&v);
 
@@ -764,7 +920,7 @@ mod tests {
         let resp = dispatch(
             &inject_req(&h, "sbx-1", Some(fixture_attestation("sbx-1", &wrong))),
             &v,
-            &verifier,
+            &gate,
         );
         assert_eq!(resp["error"]["code"], "attestation_invalid");
         assert!(resp.to_string().find("SK-SECRET").is_none());
@@ -773,18 +929,18 @@ mod tests {
         let ok = dispatch(
             &inject_req(&h, "sbx-1", Some(fixture_attestation("sbx-1", &good))),
             &v,
-            &verifier,
+            &gate,
         );
         assert_eq!(ok["credential"], "SK-SECRET");
 
         // Edge: correct-key attestation but verifier configured with the WRONG root → fails.
-        let wrong_root = Ed25519Verifier::new(*wrong.pk);
+        let wrong_gate = ed25519_gate(*wrong.pk);
         let v2 = attest_vault();
         let h2 = resolve_one(&v2);
         let resp2 = dispatch(
             &inject_req(&h2, "sbx-1", Some(fixture_attestation("sbx-1", &good))),
             &v2,
-            &wrong_root,
+            &wrong_gate,
         );
         assert_eq!(resp2["error"]["code"], "attestation_invalid");
     }
@@ -794,19 +950,19 @@ mod tests {
     #[test]
     fn tc005_missing_malformed_mismatch_rejected() {
         let kp = fixture_keypair(7);
-        let verifier = Ed25519Verifier::new(*kp.pk);
+        let gate = ed25519_gate(*kp.pk);
         let v = attest_vault();
         let h = resolve_one(&v);
 
         // (a) today's plain request — no attestation member → attestation_missing.
-        let miss = dispatch(&inject_req(&h, "sbx-1", None), &v, &verifier);
+        let miss = dispatch(&inject_req(&h, "sbx-1", None), &v, &gate);
         assert_eq!(miss["error"]["code"], "attestation_missing");
 
         // sandbox_identity missing entirely → attestation_missing (never a bind to "").
         let no_sid = dispatch(
             &json!({ "op": "inject", "handle": h, "mode": "proxy" }),
             &v,
-            &verifier,
+            &gate,
         );
         assert_eq!(no_sid["error"]["code"], "attestation_missing");
 
@@ -814,7 +970,7 @@ mod tests {
         let mut b = fixture_attestation("sbx-1", &kp);
         b["signature"] = json!("!!!not base64!!!");
         assert_eq!(
-            dispatch(&inject_req(&h, "sbx-1", Some(b)), &v, &verifier)["error"]["code"],
+            dispatch(&inject_req(&h, "sbx-1", Some(b)), &v, &gate)["error"]["code"],
             "attestation_invalid"
         );
 
@@ -822,7 +978,7 @@ mod tests {
         let mut c = fixture_attestation("sbx-1", &kp);
         c["signature"] = json!(crypto::encode_base64(&[0u8; 63]));
         assert_eq!(
-            dispatch(&inject_req(&h, "sbx-1", Some(c)), &v, &verifier)["error"]["code"],
+            dispatch(&inject_req(&h, "sbx-1", Some(c)), &v, &gate)["error"]["code"],
             "attestation_invalid"
         );
 
@@ -836,7 +992,7 @@ mod tests {
             "signature": crypto::encode_base64(&*sig_d),
         });
         assert_eq!(
-            dispatch(&inject_req(&h, "sbx-1", Some(d)), &v, &verifier)["error"]["code"],
+            dispatch(&inject_req(&h, "sbx-1", Some(d)), &v, &gate)["error"]["code"],
             "attestation_invalid"
         );
 
@@ -844,7 +1000,7 @@ mod tests {
         let evil = dispatch(
             &inject_req(&h, "sbx-1", Some(fixture_attestation("sbx-EVIL", &kp))),
             &v,
-            &verifier,
+            &gate,
         );
         assert_eq!(evil["error"]["code"], "attestation_invalid");
 
@@ -852,7 +1008,7 @@ mod tests {
         let mut wrong_alg = fixture_attestation("sbx-1", &kp);
         wrong_alg["alg"] = json!("rsa");
         assert_eq!(
-            dispatch(&inject_req(&h, "sbx-1", Some(wrong_alg)), &v, &verifier)["error"]["code"],
+            dispatch(&inject_req(&h, "sbx-1", Some(wrong_alg)), &v, &gate)["error"]["code"],
             "attestation_invalid"
         );
 
@@ -860,7 +1016,7 @@ mod tests {
         let empty = dispatch(
             &inject_req(&h, "", Some(fixture_attestation("", &kp))),
             &v,
-            &verifier,
+            &gate,
         );
         assert_eq!(empty["error"]["code"], "attestation_invalid");
 
@@ -869,7 +1025,7 @@ mod tests {
         let ok = dispatch(
             &inject_req(&h, "sbx-1", Some(fixture_attestation("sbx-1", &kp))),
             &v,
-            &verifier,
+            &gate,
         );
         assert_eq!(ok["credential"], "SK-SECRET");
     }
@@ -882,7 +1038,7 @@ mod tests {
         let h1 = resolve_one(&v);
 
         // Today's exact request shape, no attestation → delivers (opaque first-use binding).
-        let resp = dispatch(&inject_req(&h1, "sbx-1", None), &v, &PassthroughVerifier);
+        let resp = dispatch(&inject_req(&h1, "sbx-1", None), &v, &sandbox_gate());
         assert_eq!(resp["credential"], "SK-SECRET");
         assert_eq!(resp["delivery"], "proxy");
 
@@ -892,12 +1048,12 @@ mod tests {
         let resp2 = dispatch(
             &inject_req(&h2, "sbx-1", Some(garbage)),
             &v,
-            &PassthroughVerifier,
+            &sandbox_gate(),
         );
         assert_eq!(resp2["credential"], "SK-SECRET");
 
         // Replay → handle_consumed (single-use not regressed in passthrough mode).
-        let replay = dispatch(&inject_req(&h1, "sbx-1", None), &v, &PassthroughVerifier);
+        let replay = dispatch(&inject_req(&h1, "sbx-1", None), &v, &sandbox_gate());
         assert_eq!(replay["error"]["code"], "handle_consumed");
     }
 
@@ -965,5 +1121,247 @@ mod tests {
         let att = fixture_attestation("sbx-1", &kp);
         println!("ATTEST_ROOT_HEX={root_hex}");
         println!("ATTEST_SBX1={att}");
+    }
+
+    // ===================================================================================
+    // Task 011: SPIFFE identity binding seam (ADR-011). TCs drive `dispatch` in spiffe mode.
+    // ===================================================================================
+
+    // TC-011-001 / REQ-002: binding-mode config — default, opt-in, precedence, unknown refused.
+    #[test]
+    fn tc011_001_binding_mode_config() {
+        // flag wins over env.
+        assert_eq!(
+            resolve_identity_binding(Some("spiffe"), Some("sandbox")),
+            Ok(BindingMode::Spiffe),
+            "flag wins over env"
+        );
+        // env is the fallback.
+        assert_eq!(
+            resolve_identity_binding(None, Some("spiffe")),
+            Ok(BindingMode::Spiffe)
+        );
+        // both absent ⇒ Sandbox (default = today's behavior).
+        assert_eq!(
+            resolve_identity_binding(None, None),
+            Ok(BindingMode::Sandbox)
+        );
+        assert_eq!(
+            resolve_identity_binding(Some("sandbox"), None),
+            Ok(BindingMode::Sandbox)
+        );
+        // case-sensitive lowercase exactly; anything else ⇒ Err (refuse to start, never a fallback).
+        for bad in ["SPIFFE", "spiffee", "", "Sandbox"] {
+            assert!(
+                resolve_identity_binding(Some(bad), None).is_err(),
+                "value {bad:?} must refuse to start"
+            );
+        }
+    }
+
+    // TC-011-002 / REQ-001, REQ-003: spiffe mode binds the handle to the verified spiffe_id, delivers
+    // the unchanged contract response, and single-use holds.
+    #[test]
+    fn tc011_002_spiffe_binds_to_verified_spiffe_id() {
+        // Load-bearing: in spiffe mode the binding key is the spiffe_id (ID_A), NOT the outer
+        // sandbox_id ("sbx-1"). `inject_binding_key` is the live-path helper dispatch calls, so this
+        // proves the binding moved to the verified identity (not a dead wire).
+        let sid = json!({
+            "sandbox_id": "sbx-1",
+            "principal": {"spiffe_id": ID_A, "trust_tier": "attested"}
+        });
+        assert_eq!(
+            inject_binding_key(&spiffe_gate(), &sid).ok(),
+            Some(ID_A.to_string()),
+            "spiffe-mode binding key is the spiffe_id, not the sandbox_id"
+        );
+        // And sandbox mode over the SAME identity binds to the opaque sandbox_id.
+        assert_eq!(
+            inject_binding_key(&sandbox_gate(), &sid).ok(),
+            Some("sbx-1".to_string()),
+            "sandbox-mode binding key is the opaque sandbox_id"
+        );
+
+        // Dispatch-level: spiffe mode delivers the byte-for-byte contract response.
+        let v = attest_vault();
+        let h = resolve_one(&v);
+        let resp = dispatch(
+            &principal_req(&h, ID_A, "attested", "proxy"),
+            &v,
+            &spiffe_gate(),
+        );
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["delivery"], "proxy");
+        assert_eq!(resp["credential"], "SK-SECRET");
+        assert!(
+            resp.get("principal").is_none() && resp.get("spiffe_id").is_none(),
+            "no principal/SPIFFE type leaks into the response"
+        );
+        // Replay → handle_consumed (single-use precedence unchanged).
+        let replay = dispatch(
+            &principal_req(&h, ID_A, "attested", "proxy"),
+            &v,
+            &spiffe_gate(),
+        );
+        assert_eq!(replay["error"]["code"], "handle_consumed");
+
+        // env-mode delivery in spiffe mode also round-trips and fills wiped_at. Needs an env-floor
+        // secret (the seeded one is proxy-floor, and raise-only would keep env→proxy).
+        v.lock().unwrap().put(
+            "vault://test/env_key",
+            "SK-ENV",
+            Mode::Env,
+            Binding {
+                host: "api.example.com".into(),
+                header: "Authorization".into(),
+                scheme: "Bearer".into(),
+                env_var: "API_KEY".into(),
+            },
+        );
+        let h2 = v.lock().unwrap().resolve("vault://test/env_key", 300)["handle"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let env = dispatch(
+            &principal_req(&h2, ID_A, "attested", "env"),
+            &v,
+            &spiffe_gate(),
+        );
+        assert_eq!(env["delivery"], "env");
+        assert_eq!(env["credential"], "SK-ENV");
+        assert!(env.get("wiped_at").is_some(), "env mode fills wiped_at");
+    }
+
+    // TC-011-003 / REQ-003: a bound handle rejects a different principal; the dispatch-level replay is
+    // handle_consumed (consumed precedes binding, ADR-003). The pure binding-over-spiffe_id check is
+    // exercised at the Vault unit level (see src/vault.rs `spiffe_id_is_the_discriminating_binding_key`).
+    #[test]
+    fn tc011_003_bound_handle_rejects_other_principal() {
+        let v = attest_vault();
+        let h1 = resolve_one(&v);
+        // First inject binds H1 to ID_A and consumes it.
+        let first = dispatch(
+            &principal_req(&h1, ID_A, "attested", "proxy"),
+            &v,
+            &spiffe_gate(),
+        );
+        assert_eq!(first["credential"], "SK-SECRET");
+        // Second inject of H1 with a DIFFERENT principal (ID_B) → error, never the credential.
+        let second = dispatch(
+            &principal_req(&h1, ID_B, "attested", "proxy"),
+            &v,
+            &spiffe_gate(),
+        );
+        assert_eq!(second["error"]["code"], "handle_consumed");
+        assert!(
+            second.get("credential").is_none(),
+            "no credential on rejection"
+        );
+        // ID_A and ID_B differ only in the final path segment — the whole URI is the key.
+        assert_ne!(ID_A, ID_B);
+        assert_eq!(&ID_A[..ID_A.len() - 1], &ID_B[..ID_B.len() - 1]);
+    }
+
+    // TC-011-004 / REQ-004, REQ-005: fail-closed — missing principal and malformed spiffe_id / empty
+    // tier rejected in spiffe mode, with a valid control on the SAME handle proving nothing burned it.
+    #[test]
+    fn tc011_004_fail_closed_missing_and_malformed() {
+        let v = attest_vault();
+        let h = resolve_one(&v);
+
+        // (a) no principal member → principal_missing.
+        let miss = dispatch(
+            &json!({"op":"inject","handle":h,"mode":"proxy","sandbox_identity":{"sandbox_id":"sbx-1"}}),
+            &v,
+            &spiffe_gate(),
+        );
+        assert_eq!(miss["error"]["code"], "principal_missing");
+
+        // (b) malformed spiffe_id table → principal_invalid (data-driven, one assertion per entry).
+        let over_2048 = format!("spiffe://d/{}", "a".repeat(2100));
+        let malformed = [
+            "http://x/y",
+            "spiffe://",
+            "spiffe://domain",
+            "spiffe://UPPER.case/x",
+            "spiffe://d/p?q=1",
+            "spiffe://d/p#f",
+            "",
+            over_2048.as_str(),
+        ];
+        for bad in malformed {
+            let resp = dispatch(
+                &principal_req(&h, bad, "attested", "proxy"),
+                &v,
+                &spiffe_gate(),
+            );
+            assert_eq!(
+                resp["error"]["code"], "principal_invalid",
+                "spiffe_id {bad:?} must be principal_invalid"
+            );
+            assert!(resp.get("credential").is_none());
+        }
+
+        // (c) valid spiffe_id but missing/empty trust_tier → principal_invalid.
+        let empty_tier = dispatch(&principal_req(&h, ID_A, "", "proxy"), &v, &spiffe_gate());
+        assert_eq!(empty_tier["error"]["code"], "principal_invalid");
+
+        // Control: after every rejection, a valid ID_A inject on the SAME handle delivers — nothing
+        // above consumed or bound it.
+        let ok = dispatch(
+            &principal_req(&h, ID_A, "attested", "proxy"),
+            &v,
+            &spiffe_gate(),
+        );
+        assert_eq!(ok["credential"], "SK-SECRET");
+    }
+
+    // TC-011-005 / REQ-007: the resolver seam is drop-in swappable — a second impl drives the
+    // identical round-trip with no change to dispatch/Vault/contract.
+    #[test]
+    fn tc011_005_resolver_drop_in_swappable() {
+        // MockIssuerResolver: principal in the `principal` block.
+        let v1 = attest_vault();
+        let h1 = resolve_one(&v1);
+        let r1 = dispatch(
+            &principal_req(&h1, ID_A, "attested", "proxy"),
+            &v1,
+            &spiffe_gate_with(Arc::new(MockIssuerResolver)),
+        );
+        assert_eq!(r1["credential"], "SK-SECRET");
+
+        // AltTestResolver: same ID_A supplied through a DIFFERENT mechanism (a token), same wiring.
+        let v2 = attest_vault();
+        let h2 = resolve_one(&v2);
+        let r2 = dispatch(
+            &json!({"op":"inject","handle":h2,"mode":"proxy","sandbox_identity":{"sandbox_id":"sbx-1","token":"tok-A"}}),
+            &v2,
+            &spiffe_gate_with(Arc::new(AltTestResolver)),
+        );
+        assert_eq!(r2["credential"], "SK-SECRET");
+        // Both delivered the identical contract response; only the trait object differed.
+        assert_eq!(r1["delivery"], r2["delivery"]);
+    }
+
+    // TC-011-006 / REQ-001 boundary, REQ-006: default sandbox mode is byte-for-byte today's behavior;
+    // the principal member is ignored (not validated, not required).
+    #[test]
+    fn tc011_006_default_sandbox_mode_ignores_principal() {
+        let v = attest_vault();
+        // Today's exact request (no principal) → delivers.
+        let h1 = resolve_one(&v);
+        let plain = dispatch(&inject_req(&h1, "sbx-1", None), &v, &sandbox_gate());
+        assert_eq!(plain["credential"], "SK-SECRET");
+        // The same request WITH a (malformed) principal attached → still delivers (ignored).
+        let h2 = resolve_one(&v);
+        let with_principal = dispatch(
+            &json!({"op":"inject","handle":h2,"mode":"proxy","sandbox_identity":{"sandbox_id":"sbx-1","principal":{"spiffe_id":"garbage","trust_tier":""}}}),
+            &v,
+            &sandbox_gate(),
+        );
+        assert_eq!(with_principal["credential"], "SK-SECRET");
+        // Replay → handle_consumed (single-use not regressed).
+        let replay = dispatch(&inject_req(&h1, "sbx-1", None), &v, &sandbox_gate());
+        assert_eq!(replay["error"]["code"], "handle_consumed");
     }
 }
