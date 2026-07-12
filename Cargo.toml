@@ -25,3 +25,12 @@ aes-gcm = "0.10.3"
 # thread-per-connection — mirrors the existing UnixListener model exactly; no async runtime, no
 # tokio. Pinned to 0.12; small tree (ascii/chunked_transfer/httpdate/log) — dep-scan gate on task 005.
 tiny_http = "0.12"
+# Ed25519 signature VERIFICATION of the sandbox attestation at the inject edge (ADR-010, task 010).
+# Chosen over `ed25519-dalek` by dep-scan MEASUREMENT: dalek (even --no-default-features --features std)
+# pulls `zeroize` unavoidably via curve25519-dalek 4.x, the exact crate ADR-009 BLOCKED and the project
+# hand-rolled `src/zeroize.rs` to avoid, plus 16 more transitive crates. ed25519-compact with
+# `default-features = false` adds exactly ONE crate: no `zeroize`, no `rand`, no new `getrandom`
+# (its `random`/`getrandom` default features are off, so tests sign from a fixed seed and production
+# only verifies), no wasm tree. Tree clears `dep-scan check --lockfile Cargo.lock --lockfile-type
+# crates` exit 0. Pinned to 2.3.1.
+ed25519-compact = { version = "2.3.1", default-features = false }
