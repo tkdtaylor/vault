@@ -128,7 +128,34 @@ points* ([interfaces.md](interfaces.md)).
   `{error:{code:"decrypt_failed",…}}`, **never a silent wrong value, never a panic** (B-016). The
   check order is
   `unknown_handle → handle_consumed → handle_expired → handle_invalidated → handle_bound_to_other_sandbox → decrypt → deliver`
-  (B-011, B-015, B-016). *(Test: `tc002_resolve_inject_round_trips_plaintext`.)*
+  (B-011, B-015, B-016). When attestation verification is configured (B-020), it runs at the dispatch
+  edge **before** this whole sequence, and the binding key is the **verified** sandbox id.
+  *(Test: `tc002_resolve_inject_round_trips_plaintext`.)*
+
+### B-020: Verify the sandbox attestation at the dispatch edge (opt-in, transitional)
+
+- **Trigger:** an `inject` request when `--attest-trust-root-file` / `VAULT_ATTEST_TRUST_ROOT_FILE`
+  configures a 32-byte Ed25519 trust root (ADR-010). Provisional wire shape (pending exec-sandbox
+  tasks 020-021): `sandbox_identity.attestation = {alg:"ed25519", payload:<base64 canonical JSON
+  {"sandbox_id":…}>, signature:<base64 64-byte sig over the raw decoded payload>}`.
+- **Response:** vault verifies the signature over the decoded payload against the configured trust
+  root, requires the signed `sandbox_id` to equal the outer one, and passes the **verified** id into
+  `Vault::inject` as the binding key, so the handle now binds to a cryptographically-verified identity
+  instead of a caller-asserted string. Verification runs at the dispatch edge **before any `Vault`
+  call** (same layering as the SO_PEERCRED gate, B-006), so a rejected attestation never consumes,
+  binds, or expire-checks a handle.
+- **Failure modes (fail-closed):** no `attestation` member → `{error:{code:"attestation_missing",…}}`;
+  bad base64, wrong signature/payload/key, wrong `alg`, wrong/empty `sandbox_id`, or a signed id that
+  disagrees with the outer id → `{error:{code:"attestation_invalid",…}}`. `retryable:false`; no
+  credential in the response; `Vault::inject` never called.
+- **Transitional passthrough:** with **no** trust root configured, the `attestation` member is ignored
+  and the handle binds to the opaque, caller-asserted `sandbox_id` byte-for-byte as before; the
+  unverifiable-binding gap stays open in this mode (the documented, opt-in transition, ADR-010).
+  *(Tests: `tc001_trust_root_config_precedence_decode_and_reject`,
+  `tc002_valid_attestation_delivers_and_binds_verified_id`,
+  `tc003_tampered_sig_and_payload_rejected_handle_not_burned`,
+  `tc004_wrong_key_rejected_correct_key_control`, `tc005_missing_malformed_mismatch_rejected`,
+  `tc006_passthrough_no_trust_root_is_todays_behavior`.)*
 
 ### B-004: Enforce single-use + first-use sandbox binding (D5)
 
@@ -195,7 +222,9 @@ points* ([interfaces.md](interfaces.md)).
   `handle_consumed`, `handle_expired` (TTL elapsed — B-011), `handle_invalidated` (secret rotated
   after resolve — B-015), `handle_bound_to_other_sandbox`, `decrypt_failed` (tampered ciphertext —
   B-016), `encrypt_failed` (put/rotate encryption failure — B-001/B-014), `store_persist_failed`
-  (put/rotate disk write failure with `--store-path` — B-019), `rng_error`.
+  (put/rotate disk write failure with `--store-path` — B-019), `attestation_missing` /
+  `attestation_invalid` (inject attestation verification, only when a trust root is configured —
+  B-020), `rng_error`.
 - **Side effects:** none; the connection is closed after the single response.
 - **Failure modes:** the caller must treat any `error` response as a non-delivery (fail-closed);
   vault never delivers a credential for a malformed, unknown, or unsupported request.

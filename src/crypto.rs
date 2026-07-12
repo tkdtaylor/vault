@@ -106,7 +106,11 @@ fn decode_key(s: &str) -> Result<[u8; KEY_LEN], String> {
 }
 
 /// Decode an all-hex string to bytes; `None` if it contains any non-hex char or has odd length.
-fn decode_hex(s: &str) -> Option<Vec<u8>> {
+///
+/// `pub(crate)` so the attestation trust-root loader in `main.rs` can reuse the exact hex-decode
+/// accept-rules `decode_key` uses (ADR-010): the trust-root key is decoded hex-first, base64-second,
+/// identically to the master key.
+pub(crate) fn decode_hex(s: &str) -> Option<Vec<u8>> {
     if s.is_empty() || !s.len().is_multiple_of(2) {
         return None;
     }

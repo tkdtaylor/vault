@@ -1,6 +1,6 @@
 # Architecture Diagrams — vault
 
-**Last updated:** 2026-06-21 (task 007 — opt-in persistent encrypted-on-disk store via the StoreFile layer, ADR-008)
+**Last updated:** 2026-07-12 (task 010 — Ed25519 attestation verification at the inject dispatch edge, ADR-010)
 
 C4-structured Mermaid diagrams plus the primary runtime sequence. See [overview.md](overview.md)
 for prose context, [decisions/](decisions/) for the ADRs referenced here, and
@@ -130,7 +130,11 @@ sequenceDiagram
     end
 
     Note over Sandbox,Vault: inject — pull-triggered push at spawn
-    Sandbox->>Vault: {"op":"inject","handle":"…","sandbox_identity":{"sandbox_id":"sbx-1"},"mode":"env"}
+    Sandbox->>Vault: {"op":"inject","handle":"…","sandbox_identity":{"sandbox_id":"sbx-1","attestation":{…}?},"mode":"env"}
+    alt trust root configured AND attestation missing/invalid (ADR-010)
+        Vault-->>Sandbox: {"error":{"code":"attestation_missing | attestation_invalid",...}}  (verified at dispatch edge, before any Vault call, handle NOT touched)
+    else attestation ok (verified id) OR transitional passthrough (no trust root)
+    Note over Vault: binding key = verified sandbox_id (Ed25519 mode) or caller-asserted id (passthrough)
     alt unknown handle
         Vault-->>Sandbox: {"error":{"code":"unknown_handle",...}}
     else already consumed (replay)
@@ -154,6 +158,7 @@ sequenceDiagram
                 Note over Edge: wiped_at = inject-time clock (TTL enforced via injectable Clock, ADR-003)
             end
         end
+    end
     end
 
     Note over Sandbox,Vault: replay rejection — the same handle a second time

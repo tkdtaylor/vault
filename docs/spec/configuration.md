@@ -27,12 +27,21 @@ default; an **opt-in** persistent encrypted store file is enabled with `--store-
 | `--socket` | `serve` | string (path) | — | yes (serve) | Unix socket to bind; a stale socket at the path is removed first; bound `0600` |
 | `--http-addr` | `serve` | string (`HOST:PORT`) | — (absent → no HTTP listener) | no | **Opt-in** loopback HTTP read surface (ADR-006). Present → bind a read-only HTTP listener sharing the same `Vault`, but **only if** the host is literal `127.0.0.1`; a non-loopback host is **refused fail-closed** (logged, no bind). Absent → the Unix socket serves exactly as before |
 | `--store-path` | `serve` | string (path) | — (absent → in-memory only) | no | **Opt-in** persistent encrypted store (ADR-008). Present → load the encrypted store from `PATH` on startup and write-through every `put`/`rotate` atomically (`0600` JSON, ciphertext + metadata only). Falls back to `VAULT_STORE_PATH` if the flag is absent (**flag wins**). Absent → in-memory only, byte-for-byte today's behavior (no file read/written) |
+| `--attest-trust-root-file` | `serve` | string (path) | — (absent → transitional passthrough) | no | **Opt-in** Ed25519 attestation verification at the inject edge (ADR-010). Present → load a 32-byte Ed25519 **public** key (hex `64`-char or base64, whitespace-trimmed) as the trust root and verify every `inject`'s signed `sandbox_identity.attestation`, binding the handle to the **verified** sandbox id and failing closed on a missing/invalid one. Falls back to `VAULT_ATTEST_TRUST_ROOT_FILE` if the flag is absent (**flag wins**). Absent → **transitional** passthrough: the handle binds to the caller-asserted opaque `sandbox_id`, byte-for-byte today's behavior (the unverifiable-binding gap stays open in this mode) |
 
 `demo` takes no flags. A missing subcommand or a `serve` without `--socket` → usage error (exit `2`).
 A `serve` whose `--store-path` file is present but **corrupt** (bad JSON / unknown version / invalid
 base64 / wrong-length nonce) **refuses to start** with a logged diagnostic and a non-zero exit
 (`1`) — the store is never silently emptied (ADR-008 §8). A **missing** file is a fresh empty store
-(first run), not an error.
+(first run), not an error. Likewise a `serve` whose `--attest-trust-root-file` is set but **unusable**
+(unreadable, not hex-or-base64, or not exactly 32 bytes) **refuses to start** with a logged diagnostic
+and a non-zero exit (`1`): the security mode never silently degrades to passthrough (ADR-010).
+
+**Attestation verification is a transitional opt-in.** With no trust root configured, `inject` binds
+the handle to the opaque, caller-asserted `sandbox_id` exactly as before, and the documented
+unverifiable-binding gap remains open in this mode. The configured mode is the intended posture once
+exec-sandbox publishes its trust root. The attestation payload shape is **provisional** pending
+exec-sandbox tasks 020-021; the details live in ADR-010, not here.
 
 **`--http-addr` is loopback-only and fail-closed.** The HTTP read surface (`GET /v1/sys/health`,
 `GET /v1/secret/data/:path`) is zero-knowledge — a read returns the handle in a Vault KV-v2 envelope,
@@ -123,6 +132,12 @@ environment via the key-provider seam (`EnvKeyProvider`), in precedence order:
 |-----|------|--------|
 | `VAULT_STORE_PATH` | path | Fallback source for `--store-path` (the flag wins). Set → opt-in persistent encrypted store at this path; unset (and no flag) → in-memory only. |
 
+**Application — the attestation trust root (ADR-010):**
+
+| Var | Type | Effect |
+|-----|------|--------|
+| `VAULT_ATTEST_TRUST_ROOT_FILE` | path | Fallback source for `--attest-trust-root-file` (the flag wins). Set → opt-in Ed25519 attestation verification against the 32-byte public key in this file; unset (and no flag) → transitional passthrough (opaque caller-asserted binding). An unusable file refuses to start (never a silent downgrade). |
+
 The key is decoded to **exactly 32 bytes** (anything else is an error). It is held only in the
 backend's memory — **never serialized into the store, never logged**. A **missing/unreadable/wrong-
 length key fails the store closed**: `put` stores nothing and `inject` returns `decrypt_failed` —
@@ -166,7 +181,7 @@ is an ephemeral in-process value.
 | Socket | Unix domain socket at `--socket` path | `chmod 0600` **plus** an `SO_PEERCRED` peer-uid check (admit iff peer uid == server uid); co-located with the agent, not network-exposed |
 | Ports exposed | none by default; **opt-in** loopback TCP via `--http-addr 127.0.0.1:PORT` | The HTTP read surface (ADR-006) is off unless `--http-addr` is passed, and binds `127.0.0.1` only (a non-loopback bind is refused fail-closed). Read-only + zero-knowledge — never delivers a value |
 | On-disk store | none by default; **opt-in** `0600` JSON file via `--store-path PATH` / `VAULT_STORE_PATH` | The persistent encrypted store (ADR-008) is off unless a path is set. Ciphertext + non-secret metadata only; key off-disk, handles never persist; atomic `0600` write-through on `put`/`rotate`; refuse-to-start on a corrupt file |
-| Runtime dependencies | `serde` + `serde_json` + `nix` (socket+user) + `aes-gcm` 0.10.3 (AES-256-GCM) + `tiny_http` 0.12 (HTTP read surface) | `nix` supplies `SO_PEERCRED`/`geteuid` for the peer-uid gate (ADR-002); `aes-gcm` 0.10.3 supplies the at-rest AEAD (ADR-005), pinned to the stable line (the 0.11 RC was rejected) and dep-scan-cleared; `tiny_http` 0.12 (sync, thread-per-connection — no async runtime) supplies the opt-in loopback HTTP read surface (ADR-006), pinned and dep-scan-cleared (tree: `ascii`/`chunked_transfer`/`httpdate`/`log`); no `rand` crate (RNG/nonces via `/dev/urandom`); dep-scan / code-scanner are blocking gates for any further crypto/dependency change |
+| Runtime dependencies | `serde` + `serde_json` + `nix` (socket+user) + `aes-gcm` 0.10.3 (AES-256-GCM) + `tiny_http` 0.12 (HTTP read surface) + `ed25519-compact` 2.3.1 (attestation verify, default-features off) | `nix` supplies `SO_PEERCRED`/`geteuid` for the peer-uid gate (ADR-002); `aes-gcm` 0.10.3 supplies the at-rest AEAD (ADR-005), pinned to the stable line (the 0.11 RC was rejected) and dep-scan-cleared; `tiny_http` 0.12 (sync, thread-per-connection, no async runtime) supplies the opt-in loopback HTTP read surface (ADR-006), pinned and dep-scan-cleared (tree: `ascii`/`chunked_transfer`/`httpdate`/`log`); `ed25519-compact` 2.3.1 with `default-features = false` supplies verify-only Ed25519 for the attestation gate (ADR-010), chosen over `ed25519-dalek` by dep-scan measurement (dalek pulls the BLOCKED `zeroize`), adding exactly one crate with no `zeroize`/`rand`/new `getrandom`; no `rand` crate (RNG/nonces via `/dev/urandom`); dep-scan / code-scanner are blocking gates for any further crypto/dependency change |
 | Master key | `VAULT_MASTER_KEY` / `VAULT_MASTER_KEY_FILE` (32 bytes, hex/base64) | required for a production `serve` (store fails closed without it); `demo` uses an ephemeral in-process key |
 
 ---
