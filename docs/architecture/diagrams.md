@@ -1,6 +1,6 @@
 # Architecture Diagrams — vault
 
-**Last updated:** 2026-07-12 (task 010 — Ed25519 attestation verification at the inject dispatch edge, ADR-010)
+**Last updated:** 2026-07-12 (task 011 — SPIFFE identity binding at the inject dispatch edge, ADR-011; task 010 attestation verify, ADR-010)
 
 C4-structured Mermaid diagrams plus the primary runtime sequence. See [overview.md](overview.md)
 for prose context, [decisions/](decisions/) for the ADRs referenced here, and
@@ -130,11 +130,13 @@ sequenceDiagram
     end
 
     Note over Sandbox,Vault: inject — pull-triggered push at spawn
-    Sandbox->>Vault: {"op":"inject","handle":"…","sandbox_identity":{"sandbox_id":"sbx-1","attestation":{…}?},"mode":"env"}
+    Sandbox->>Vault: {"op":"inject","handle":"…","sandbox_identity":{"sandbox_id":"sbx-1","attestation":{…}?,"principal":{…}?},"mode":"env"}
     alt trust root configured AND attestation missing/invalid (ADR-010)
         Vault-->>Sandbox: {"error":{"code":"attestation_missing | attestation_invalid",...}}  (verified at dispatch edge, before any Vault call, handle NOT touched)
-    else attestation ok (verified id) OR transitional passthrough (no trust root)
-    Note over Vault: binding key = verified sandbox_id (Ed25519 mode) or caller-asserted id (passthrough)
+    else spiffe mode AND principal missing/invalid (ADR-011)
+        Vault-->>Sandbox: {"error":{"code":"principal_missing | principal_invalid",...}}  (resolved after attestation, before any Vault call, handle NOT touched)
+    else identity pipeline ok
+    Note over Vault: binding key = spiffe_id (spiffe mode) or verified/opaque sandbox_id (sandbox mode)
     alt unknown handle
         Vault-->>Sandbox: {"error":{"code":"unknown_handle",...}}
     else already consumed (replay)

@@ -157,6 +157,30 @@ points* ([interfaces.md](interfaces.md)).
   `tc004_wrong_key_rejected_correct_key_control`, `tc005_missing_malformed_mismatch_rejected`,
   `tc006_passthrough_no_trust_root_is_todays_behavior`.)*
 
+### B-021: Identity-binding mode — bind the handle to a SPIFFE workload identity (opt-in)
+
+- **Trigger:** an `inject` request when `--identity-binding spiffe` / `VAULT_IDENTITY_BINDING=spiffe`
+  is set (ADR-011). The caller propagates the agent-mesh verified-principal block
+  `sandbox_identity.principal = {spiffe_id, trust_tier}`.
+- **Response:** the mock issuer validates the principal's shape (a well-formed `spiffe_id` per the
+  documented subset + a non-empty `trust_tier`) and vault binds the handle's first-use key to the
+  **`spiffe_id`** instead of the opaque `sandbox_id`, so a handle first injected by one workload
+  identity can never be presented by another (the whole URI is the key, no prefix matching). The
+  contract response is byte-for-byte unchanged (no principal type leaks out). Principal resolution
+  runs at the dispatch edge **after** attestation verify (B-020) and **before** any `Vault` call.
+- **SPIFFE-ID subset (fail-closed):** scheme exactly `spiffe://`; non-empty lowercase `[a-z0-9.-]`
+  trust domain; non-empty `/`-prefixed path; no query/fragment; ≤ 2048 bytes. Anything else, or a
+  missing/empty `trust_tier`, → `{error:{code:"principal_invalid",…}}`; a missing `principal` member →
+  `{error:{code:"principal_missing",…}}`. `retryable:false`; no credential; `Vault::inject` never
+  called; the handle is neither consumed nor bound.
+- **Default (sandbox) mode:** with no flag/env (or `sandbox`), the binding key is the (B-020 verified,
+  else opaque) `sandbox_id` byte-for-byte as before; the `principal` member is ignored. An unknown
+  `--identity-binding` value refuses to start (never a silent fallback). *(Tests:
+  `tc011_001_binding_mode_config`, `tc011_002_spiffe_binds_to_verified_spiffe_id`,
+  `tc011_003_bound_handle_rejects_other_principal`, `tc011_004_fail_closed_missing_and_malformed`,
+  `tc011_005_resolver_drop_in_swappable`, `tc011_006_default_sandbox_mode_ignores_principal`,
+  and `src/vault.rs::spiffe_id_is_the_discriminating_binding_key`.)*
+
 ### B-004: Enforce single-use + first-use sandbox binding (D5)
 
 - **Trigger:** any `inject` against a handle that has already been used, or by a different sandbox.
@@ -224,7 +248,8 @@ points* ([interfaces.md](interfaces.md)).
   B-016), `encrypt_failed` (put/rotate encryption failure — B-001/B-014), `store_persist_failed`
   (put/rotate disk write failure with `--store-path` — B-019), `attestation_missing` /
   `attestation_invalid` (inject attestation verification, only when a trust root is configured —
-  B-020), `rng_error`.
+  B-020), `principal_missing` / `principal_invalid` (inject principal resolution, only in spiffe
+  identity-binding mode — B-021), `rng_error`.
 - **Side effects:** none; the connection is closed after the single response.
 - **Failure modes:** the caller must treat any `error` response as a non-delivery (fail-closed);
   vault never delivers a credential for a malformed, unknown, or unsupported request.
